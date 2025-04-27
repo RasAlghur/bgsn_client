@@ -1,28 +1,30 @@
-# File 1
+# File 2
+from flask import Flask, request, jsonify
+from twocaptcha import TwoCaptcha
+from celery import Celery
 import requests
 from httpx import AsyncClient, HTTPStatusError, TimeoutException, RequestError
 import random
 from collections import defaultdict
+import pickle
+from functools import lru_cache
 import time
 import aiohttp
 import logging
 import os
 from os import getenv, path, makedirs
 from playwright.async_api import async_playwright
-import re
-import redis.asyncio as aioredis
-from asyncio import TimeoutError, create_task, sleep, run, Semaphore, gather, new_event_loop, set_event_loop
+from playwright_stealth import stealth_async
 from aiohttp import ClientSession, TCPConnector, ClientTimeout
 from aiohttp.client_exceptions import ClientError
-from redis.asyncio import Redis, ConnectionPool
 import json
+import re
 from collections import deque
 from dotenv import load_dotenv
 from requests.exceptions import ConnectionError, Timeout, RequestException
-# from datetime import datetime, timedelta
 from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
-from asyncio import TimeoutError, sleep, run, Semaphore, gather, new_event_loop, set_event_loop
+from asyncio import TimeoutError, create_task, sleep, run, Semaphore, gather, new_event_loop, set_event_loop
 from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackContext, CallbackQueryHandler
@@ -34,14 +36,53 @@ from multiprocessing import Pool, cpu_count
 from openpyxl import Workbook
 from itertools import cycle
 from functools import wraps
+import uuid
+import threading
+
+# In-memory job storage (replace with Redis for production)
+jobs = {}
 
 load_dotenv()
 API_KEY = getenv('HELIUS_API_KEY')
 BAGSCAN_API_KEY = getenv('BAGSCAN_API_KEY')
-SERVER_URL = getenv('SERVER_URL')
-
 TELEGRAM_BOT_TOKEN = getenv('TELEGRAM_BOT_TOKEN')
+app = Flask(__name__)
+app.config['CELERY_BROKER_URL'] = os.getenv('CELERY_BROKER_URL')
+app.config['CELERY_RESULT_BACKEND'] = os.getenv('CELERY_RESULT_BACKEND')
 
+# 2Captcha API key
+CAPTCHA_API_KEY = getenv('TWOCAPTCHA_API_KEY')
+solver = TwoCaptcha(CAPTCHA_API_KEY)
+
+# Set your User-Agent
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+HOOK_SCRIPT = r"""
+(() => {
+  const interval = setInterval(() => {
+    if (window.turnstile) {
+      clearInterval(interval);
+      window.turnstile.render = (elem, opts) => {
+        window._cfTurnstileParams = {
+          type: "TurnstileTaskProxyless",
+          sitekey: opts.sitekey,
+          url:     window.location.href,
+          data:    opts.cData,
+          pagedata:opts.chlPageData,
+          action:  opts.action,
+          userAgent: navigator.userAgent
+        };
+        window._cfTurnstileCallback = opts.callback;
+        return "intercepted";
+      };
+    }
+  }, 10);
+})();
+"""
 ADDRESSES = [
     '4YduJ6ECHZmsas9iaEx4KtdzoSxcbrzSggYaP3P6hHjJ',
     '2cK5D5CQMQkB1A8Gn6UF4kLEgTpVDXqBSSdTYJZEHMZC',
@@ -53,11 +94,30 @@ ADDRESSES = [
 
 ANALYSES_PERIOD = 30 #30 days
 SOL_ADDR = "So11111111111111111111111111111111111111112"
-GET_ASSET_URL = f'https://mainnet.helius-rpc.com/?api-key={API_KEY}'
+USDT_ADDR = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 
+
+SIGNATURES_URL = f"https://mainnet.helius-rpc.com/?api-key={API_KEY}"
+TRANSACTIONS_URL = f"https://api.helius.xyz/v0/transactions?api-key={API_KEY}"
+
+BASE_URL = f'https://api.helius.xyz/v0/addresses'
+GET_ASSET_URL = f'https://mainnet.helius-rpc.com/?api-key={API_KEY}'
+GET_NATIVE_BAL_URL = f'https://api.mainnet-beta.solana.com'
+
+LINE_MULTIPLIER = 40
 MAX_RETRIES = 5
 SLEEP_TIME = 30
+SHORT_SLEEP_TIME = 1
 semaphore = Semaphore(10)
+
+# State management: keep track of whether we're expecting a token address or holder addresses
+USER_STATE = {}
+
+web_Unlocker = {
+    "server": "brd.superproxy.io:33335",
+    "username": "brd-customer-hl_d768f7e0-zone-bag_unlocker",
+    "password": "g9vjzx8i7zi9",
+}
 
 # Enable logging
 logging.basicConfig(
@@ -70,1985 +130,1741 @@ user_data = {}  # Initialize user data storage
 greeted_users = {}
 # Semaphore to limit concurrent usage of each proxy
 PROXY_LIMIT = 5  # Adjust based on your proxy provider's limits
-# proxy_usage = {}
-proxy_usage = defaultdict(lambda: Semaphore(1))  # Ensure all proxies have a semaphore
+proxy_usage = {}
 
-def get_sol_balance(address, proxy):
-    """
-    Fetch the SOL balance for a given address, optionally using a proxy.
-    """
-    params = {"address": address}
-    if proxy:
-        params["proxy"] = proxy
+# Track proxy performance
+proxy_stats = {}
+proxy_cooldowns = {}
+COOLDOWN_PERIOD = 30  # seconds
+CACHE_TIMEOUT = 60 * 60  # 60 minutes in seconds
 
-    response = requests.get(
-        f"{SERVER_URL}/getSolBalance",
-        headers={"Authorization": f"Bearer {BAGSCAN_API_KEY}"},
-        params=params
+# In-memory cache for ultra-fast lookups
+TOKEN_CACHE = {}
+
+API_KEY = "b8f17a47139305b3a8ee6b34bc64615d1670f37df278f10dd04a3cd3440d94cb"  # Keep this secret!
+
+def make_celery(app):
+    celery = Celery(
+        app.import_name,
+        broker=app.config['CELERY_BROKER_URL'],
+        backend=app.config['CELERY_RESULT_BACKEND']
     )
+    celery.conf.update(app.config)
+    TaskBase = celery.Task
+    class ContextTask(TaskBase):
+         def __call__(self, *args, **kwargs):
+             with app.app_context():
+                 return TaskBase.__call__(self, *args, **kwargs)
+    celery.Task = ContextTask
+    return celery
 
-    if response.status_code == 200:
-        return response.json()  # Returns {"balance": <amount>}
-    else:
-        raise Exception(f"Error: {response.status_code}, {response.text}")
+celery = make_celery(app)
 
-# Function to load proxies from a file
-async def load_proxies(file_path):
-    async with aiofiles.open(file_path, 'r') as file:
-        proxies = [line.strip() for line in await file.readlines()]
-    return proxies
+# Function to verify the API key
+def verify_api_key():
+    client_api_key = request.headers.get("Authorization", "").replace("Bearer ", "")
+    return client_api_key == API_KEY
 
-async def get_next_available_proxy(proxy_cycle):
-    """Get the next available proxy that is not fully occupied."""
-    while True:
-        proxy = next(proxy_cycle)
-        if proxy not in proxy_usage:
-            proxy_usage[proxy] = Semaphore(PROXY_LIMIT)
-        if not proxy_usage[proxy].locked():  # Ensure proxy is not overloaded
-            return proxy
-
-# Create Redis connection
-async def create_redis_connection_pool():
-    attempt = 0
-    while attempt < MAX_RETRIES:
-        try:
-            r = await aioredis.from_url(
-                'redis://redis-16610.c14.us-east-1-2.ec2.redns.redis-cloud.com:16610',
-                password='ByR0uxTKKJ8YqUL0Rf4sdyfsWjIsXAAr'
-            )
-            # r = Redis(connection_pool=pool)
-            print("Connected to Redis successfully.")
-            return r
-        except (aioredis.ConnectionError, aioredis.TimeoutError) as e:
-            attempt += 1
-            print(f"Connection attempt {attempt} failed: {e}. Retrying in 1 second...")
-            await sleep(SLEEP_TIME)
-
-    print("Failed to connect to Redis after multiple attempts.")
-    raise Exception("Unable to connect to Redis.")
-
-def parse_relative_time(relative_time_str, current_time=None):
-    """Convert a relative time string like '5 mins ago' to a timestamp."""
-    if current_time is None:
-        current_time = datetime.now()
-        
+async def take_error_screenshot(page, error_context, retry=None):
+    """
+    Save a screenshot with a filename based on the error context and current time.
+    """
+    screenshots_dir = "error_screenshots"
+    os.makedirs(screenshots_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    retry_part = f"_retry{retry}" if retry is not None else ""
+    screenshot_path = f"{screenshots_dir}/{error_context}_{timestamp}{retry_part}.png"
     try:
-        # Handle different time formats
-        if "ago" in relative_time_str:
-            parts = relative_time_str.lower().replace("ago", "").strip().split()
-            
-            if len(parts) >= 2:  # Make sure we have both number and unit
-                amount = int(parts[0])
-                unit = parts[1].rstrip('s')  # Remove trailing 's' if present
-                
-                if unit == "min" or unit == "minute":
-                    return current_time - timedelta(minutes=amount)
-                elif unit == "hour":
-                    return current_time - timedelta(hours=amount)
-                elif unit == "day":
-                    return current_time - timedelta(days=amount)
-                elif unit == "second":
-                    return current_time - timedelta(seconds=amount)
-        
-        # If format not recognized or parsing failed, log it and return current time
-        logger.warning(f"Could not parse relative time: {relative_time_str}")
-        return current_time
+        await page.screenshot(path=screenshot_path, full_page=True)
+        logger.info(f"Screenshot saved: {screenshot_path}")
+    except Exception as ss_err:
+        logger.error(f"Failed to take screenshot: {ss_err}")
+    return screenshot_path
+
+def ensure_directory_exists(directory):
+    """Ensure that the specified directory exists."""
+    if not path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+
+# Function to check if a proxy is active (async)
+async def is_proxy_active(proxy):
+    url = "https://httpbin.org/ip"  # A simple endpoint to test the proxy
+    try:
+        ip, port, username, password = proxy.split(':')
+        proxy_url = f"http://{username}:{password}@{ip}:{port}"
+
+        async with ClientSession(timeout=ClientTimeout(total=3.0)) as session:
+            async with session.get(url, proxy=proxy_url) as response:
+                if response.status == 200:
+                    return True
     except Exception as e:
-        logger.error(f"Error parsing relative time '{relative_time_str}': {e}")
-        return current_time
-    
-# Function to distribute proxies to addresses using round-robin
-def round_robin_proxies(proxies, addresses):
-    proxy_map = {}
-    proxy_iter = iter(proxies)  # Create an iterator from the list of proxies
-    
-    for address in addresses:
-        proxy_map[address] = next(proxy_iter)  # Assign the next proxy in the round-robin cycle
-        
-        # If we've run out of proxies, restart the cycle
-        if proxy_iter is None:
-            proxy_iter = iter(proxies)
-    
-    return proxy_map
-
-#For main file 
-#For main file 
-#For main file
-# Extract unique tokens from transactions
-def extract_unique_tokens(relevant_transactions):
-    unique_tokens = set()
-
-    # Ensure we're getting the actual list
-    # transactions_list = relevant_transactions
-
-    for transaction in relevant_transactions:
-        token_sold = transaction.get("token_sold_address")
-        token_bought = transaction.get("token_bought_address")
-
-        if token_sold:
-            unique_tokens.add(token_sold)
-        if token_bought:
-            unique_tokens.add(token_bought)
-
-    unique_tokens_list = list(unique_tokens)
-    
-    # Debugging output
-    print("Extracted Unique Tokens:", unique_tokens_list)
-
-    return unique_tokens_list
-
-
-def generate_wallet_summary(sol_balance_value, number_of_tokens_traded, profitable_trades,
-        unprofitable_trades, winrate, avg_hld_tme, average_buy_per_trade, average_trades_per_day,
-        first_transaction_trade_time, average_buy_size, total_sol_spent_usd, total_sol_spent,
-        total_sol_made_usd, total_sol_made, profit_loss, profit_loss_usd, profit_loss_roi, tokens_with_more_sells_than_buys, 
-        tokens_with_short_hold_duration, tokens_with_high_scam_score, longest_winning_streak, longest_losing_streak, total_gas_fees, average_gas_fee,
-        total_jito_fees, average_jito_fee, address, analyses_period, mc_categories):
-    summary = []
-    summary.append(f"🧾 Overall Wallet Summary for {address} in {analyses_period} days")
-    summary.append("=" * 30)
-    if sol_balance_value is not None:
-        summary.append(f"🔹 Balance: {sol_balance_value:.9f} SOL")
-    summary.append(f"🔹 Number of Tokens Traded: {number_of_tokens_traded} tokens")
-    summary.append(f"🔹 Profitable Trades: {profitable_trades} / {number_of_tokens_traded} tokens")
-    summary.append(f"🔹 Unprofitable Trades: {unprofitable_trades} / {number_of_tokens_traded} tokens")
-    summary.append(f"🔹 Winrate: {winrate:.2f}%\n")
-    summary.append(f"🔹 Average Held Duration: {avg_hld_tme}")
-    summary.append(f"🔹 Average Buys per Trade: {average_buy_per_trade:.2f}")
-    summary.append(f"🔹 Average Trades per Day: {average_trades_per_day:.2f}")
-    summary.append(f"🔹 Last Trade Time: {first_transaction_trade_time}\n")
-    summary.append(f"🔹 Avg Buy Size (SOL): {average_buy_size:.2f}")
-    # summary.append(f"🔹 Total Gas Fees (SOL): { total_gas_fees:.4f}")
-    # summary.append(f"🔹 Avg Gas Fees (SOL): {average_gas_fee:.4f}")
-    # summary.append(f"🔹 Total Jito Fees (SOL): { total_jito_fees:.4f}")
-    # summary.append(f"🔹 Avg Jito Fees (SOL): {average_jito_fee:.4f}")
-    summary.append(f"🔹 Total SOL Spent (USD): {total_sol_spent:.9f}SOL (${total_sol_spent_usd:.2f})")
-    summary.append(f"🔹 Total SOL Made (USD): {total_sol_made:.9f}SOL (${total_sol_made_usd:.2f})")
-    summary.append(f"🔹 PNL: {profit_loss:.9f} SOL (${profit_loss_usd:.2f})")
-    summary.append(f"🔹 PNL ROI: {profit_loss_roi:.2f}%\n")
-    
-    summary.append(f"🔹 Tokens with More Sells than Buys: {tokens_with_more_sells_than_buys}")
-    summary.append(f"🔹 Tokens with Short Hold Duration (< 1 min): {tokens_with_short_hold_duration}")
-    summary.append(f"🔹 Scam tokens purchased: {tokens_with_high_scam_score}")
-    summary.append("🔹 Longest Winning Streak: {}".format(longest_winning_streak))
-    summary.append("🔹 Longest Losing Streak: {}".format(longest_losing_streak))
-    
-     # Market Capitalization Distribution
-    summary.append("\n🔹 Market Capitalization Distribution of Tokens:")
-    summary.append("=" * 30)
-    for category, count in mc_categories.items():
-        summary.append(f"{category}: {count} tokens")
-    return "\n".join(summary)
-
-def generate_best_trade(best_trade):
-    if best_trade:
-        trade_info = []
-        trade_info.append("🏆 Best Trade Based on ROI")
-        trade_info.append("=" * 30)
-        trade_info.append(f"🔹 Token Address: {best_trade['token_address']} ({best_trade['symbol']})")
-        trade_info.append(f"🔹 Buys: {best_trade['buys']}, Sells: {best_trade['sells']}")
-        trade_info.append(f"🔹 Total Bought Amount: {best_trade['buy_amount']:.2f} {best_trade['symbol']} (Spent {best_trade['sol_spent']:.9f} SOL)")
-        trade_info.append(f"🔹 Total Sold Amount: {best_trade['sell_amount']:.2f} {best_trade['symbol']} (Made {best_trade['sol_made']:.9f} SOL)")
-        trade_info.append(f"🔹 Held Duration: {best_trade['hold_duration']}")
-        trade_info.append(f"🔹 Profit: {best_trade['profit_loss']:.9f} SOL (${best_trade['profit_loss_usd']:.2f})")
-        trade_info.append(f"🔹 ROI: {best_trade['pnl_roi']:.2f}%")
-        return "\n".join(trade_info)
-    else:
-        return "No Best Trade!!"
-
-def safe_int_conversion(value):
-    try:
-        return int(value)
-    except ValueError:
-        return 0
-
-async def save_account_transactions_to_file(update, address, relevant_transactions, analyses_period, proxy, results):
-    # print("Here")
-    token_addresses = set()
-    token_trade_summary = {}
-    
-    # Define the MC categories counters
-    mc_categories = {
-        '<5K': 0,
-        '5K-30K': 0,
-        '30K-100K': 0,
-        '100K-300K': 0,
-        '300K+': 0,
-    }
-    
-    total_sol_spent = 0
-    total_sol_made = 0
-    profitable_trades = 0
-    unprofitable_trades = 0
-    number_of_tokens_traded = 0 
-    best_trade = None
-    best_trade_roi = -float('inf')
-    
-    # Initialize variables for tracking streaks
-    current_winning_streak = 0
-    current_losing_streak = 0
-    longest_winning_streak = 0
-    longest_losing_streak = 0
-    total_gas_fees = 0.0
-    total_jito_fees = 0.0
-    transaction_count = 0
-    tokens_with_high_scam_score = 0
-
-    for transaction in relevant_transactions:
-        token_sold = transaction.get("token_sold")
-        token_bought = transaction.get("token_bought")
-
-        token_addresses.add(token_sold)
-        token_addresses.add(token_bought)
-
-    # token_metadata = await fetch_the_metadata(token_addresses, proxy)
-    sol_balance = get_sol_balance(address, proxy)
-    logger.info(f"sol_balance: {sol_balance['balance']}")
-    # sol_metadata = token_metadata.get(SOL_ADDR, {})
-    # sol_cur_price = sol_metadata.get('token_info', {}).get('price_info', {}).get('price_per_token', 236)
-    sol_cur_price = await get_asset(SOL_ADDR, proxy)
-    logger.info(f"sol_cur_price: {sol_cur_price["price_per_token"]}")
-    
-    # Create a new Excel workbook and worksheet
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = f"Trade - {address[:10]}"
-
-    # Track the current row
-    current_row = 1
-
-    # Add title and header rows
-    ws.merge_cells('A1:N1')
-    ws['A1'] = f"{analyses_period} Days Trade Analysis of Wallet {address}"
-    ws['A1'].font = Font(size=16, bold=True)
-    # ws['A1'].alignment = Alignment(horizontal="center")
-    ws['A1'].alignment = Alignment(horizontal="center", vertical="center")
-
-    # Increment the row for the header
-    current_row += 1
-    
-    # Add column headers
-    # headers = ["Signature", "Token Bought", "Token Bought Amount", "Token Sold", "Token Sold Amount", "Trade Time", "Sol Amount in Txn (SOL)", "USD Value", "Gas spent (SOL)", "Jito Fees (SOL)"]
-    headers = ["Signature", "Token Bought", "Token Bought Amount", "Token Sold", "Token Sold Amount", "Trade Time", "USD Value"]
-    ws.append(headers)
-    
-    # Style headers (bold, fill color)
-    header_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    for cell in ws[2]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    # Increment the row after headers are filled
-    current_row += 1
-    # print("Here 3")
-
-    for transaction in relevant_transactions:
-        timestamp_rltv = transaction.get("trade_time_relative")
-        trade_time_unix = transaction.get("trade_time_unix")
-        # trade_time_utc = transaction.get("trade_time_utc")
-        token_sold = transaction.get("token_sold")
-        token_sold_address = transaction.get("token_sold_address")
-        token_bought = transaction.get("token_bought")
-        token_bought_address = transaction.get("token_bought_address")
-        token_bought_amount_str = transaction.get("token_bought_amount")
-        token_sold_amount_str = transaction.get("token_sold_amount")
-
-
-        txn_usd_value_chr = transaction.get("txn_usd_value", "$0")
-        usd_value_str = float(txn_usd_value_chr.replace("$", "").replace(",", "")) if txn_usd_value_chr and txn_usd_value_chr.lower() != "n/a" else 0.0
-
-        token_bought_amount_int = token_bought_amount_str.replace(",", "") if token_bought_amount_str else 0
-        token_sold_amount_int = token_sold_amount_str.replace(",", "") if token_sold_amount_str else 0
-        
-        # txn_usd_value = float(transaction.get('txn_usd_value', 0) or 0)
-        def safe_float(value):
-            try:
-                # Handle if value is already a number or a string number.
-                return float(value)
-            except (ValueError, TypeError):
-                return 0.0
-
-        token_sold_amount = safe_float(token_sold_amount_int)
-        token_bought_amount = safe_float(token_bought_amount_int)
-        # usd_value = safe_float(transaction.get('txn_usd_value', 0))
-        usd_value = safe_float(usd_value_str)
-
-        gas_fee = float(transaction.get('gas_fee', 0) or 0)
-        total_gas_fees += gas_fee
-        jito_fee = float(transaction.get('jito_fees', 0) or 0)
-        sol_amount_in_txn = float(transaction.get('sol_amount_in_txn', 0) or 0)
-        total_jito_fees += jito_fee
-        transaction_count += 1
-        
-        # Ensure that the values are not None, and replace None with a default value (e.g., 0.0)
-        gas_fee = transaction.get('gas_fee', 0.0) if transaction.get('gas_fee') is not None else 0.0
-        jito_fee = transaction.get('jito_fee', 0.0) if transaction.get('jito_fee') is not None else 0.0
-       
-        # Format the values to 9 decimal places, ensuring no scientific notation
-        formatted_gas_fee = f"{gas_fee:.9f}"
-        formatted_jito_fee = f"{jito_fee:.9f}"
-        
-        # Append transaction data to Excel sheet
-        ws.append([
-            transaction['signature'],
-            # transaction['block_timestamp'],
-            f"{token_bought_address} ({token_bought})",
-            f"{token_bought_amount} {token_bought}",
-            f"{token_sold_address} ({token_sold})",
-            f"{token_sold_amount} {token_sold}",
-            timestamp_rltv,
-            # f"{sol_amount_in_txn}",
-            usd_value,
-            # formatted_gas_fee,
-            # formatted_jito_fee,
-        ])
-    
-        # Formatting: alternate row shading
-        if current_row % 2 == 0:
-            for cell in ws[current_row]:
-                cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
-                cell.alignment = Alignment(horizontal="center")
-
-        for col in range(1, len(headers) + 1):
-            cell = ws.cell(row=current_row, column=col)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            
-        
-        current_row += 1
-
-        if token_sold_address not in token_trade_summary:
-            token_trade_summary[token_sold_address] = {'buys': 0, 'sells': 0, 'total_buy_amount': 0, 'total_sell_amount': 0, 'sol_spent': 0, 'sol_made': 0, 'first_buy_timestamp': None, 'last_sell_timestamp': None, 'first_buy_mc': None, 'last_sell_mc': None, 'current_mc': None}
-        if token_bought_address not in token_trade_summary:
-            token_trade_summary[token_bought_address] = {'buys': 0, 'sells': 0, 'total_buy_amount': 0, 'total_sell_amount': 0, 'sol_spent': 0, 'sol_made': 0, 'first_buy_timestamp': None, 'last_sell_timestamp': None, 'first_buy_mc': None, 'last_sell_mc': None, 'current_mc': None}
-
-        if token_sold_address == SOL_ADDR and token_bought_address != SOL_ADDR:
-            if token_bought_address in results["results"]:
-                token_data = results["results"][token_bought_address]
-                
-                token_trade_summary[token_bought_address]['buys'] += 1
-                token_trade_summary[token_bought_address]['total_buy_amount'] += token_bought_amount
-                token_trade_summary[token_bought_address]['sol_spent'] += token_sold_amount
-                total_sol_spent += token_sold_amount
-                token_trade_summary[token_bought_address]['first_buy_timestamp'] = trade_time_unix
-                token_value = token_sold_amount / token_bought_amount if token_bought_amount else 0
-                
-                token_base_price = token_data.get("basePrice", "N/A")
-                token_quote_price = token_data.get("quotePrice", "N/A")
-                if token_base_price > token_quote_price:
-                    token_bought_cur_price = token_quote_price
-                else:
-                    token_bought_cur_price = token_base_price
-
-                if token_bought_cur_price == "N/A":
-                    token_bought_cur_price = 0
-                else:
-                    token_bought_cur_price = float(token_bought_cur_price)
-                
-                token_bought_supply = token_data.get("supply", 0)
-                if token_bought_supply == "N/A":
-                    token_bought_supply = 0
-                else:
-                    token_bought_supply = float(token_bought_supply)
-                
-                token_bought_decimals = token_data.get("decimals", 0)
-                if token_bought_decimals == "N/A":
-                    token_bought_decimals = 0
-                else:
-                    token_bought_decimals = int(token_bought_decimals)
-                
-                # Calculate adjusted supply
-                if token_bought_supply and token_bought_decimals:
-                    token_bought_supply = token_bought_supply / (10 ** token_bought_decimals)
-                
-                first_buy_mc = token_value * sol_cur_price["price_per_token"] * token_bought_supply
-                token_trade_summary[token_bought_address]['first_buy_mc'] = first_buy_mc
-                    
-                token_current_mc = token_bought_cur_price * token_bought_supply
-                token_trade_summary[token_bought_address]['current_mc'] = token_current_mc
-            
-            logger.info(f"case 1")
-            logger.info(f" Token Sold: token_trade_summary[{token_sold_address}]: {token_trade_summary[token_sold_address]}")
-            logger.info(f" Token Bought: token_trade_summary[{token_bought_address}]: {token_trade_summary[token_bought_address]}")
-
-            
-        elif token_bought_address == SOL_ADDR and token_sold_address != SOL_ADDR:
-            token_trade_summary[token_sold_address]['sells'] += 1
-            token_trade_summary[token_sold_address]['total_sell_amount'] += token_sold_amount
-            token_trade_summary[token_sold_address]['sol_made'] += token_bought_amount
-            total_sol_made += token_bought_amount
-
-            if token_trade_summary[token_sold_address]['last_sell_timestamp'] is None:
-                token_trade_summary[token_sold_address]['last_sell_timestamp'] = trade_time_unix
-                
-                token_value = token_bought_amount / token_sold_amount if token_sold_amount else 0
-                
-                # Get token data from results
-                if token_sold_address in results["results"]:
-                    token_data = results["results"][token_sold_address]
-                    
-                    # Extract current price
-                    token_base_price = token_data.get("basePrice", "N/A")
-                    token_quote_price = token_data.get("quotePrice", "N/A")
-                    if token_base_price > token_quote_price:
-                        token_sold_cur_price = token_quote_price
-                    else:
-                        token_sold_cur_price = token_base_price
-
-                    if token_sold_cur_price == "N/A":
-                        token_sold_cur_price = 0
-                    else:
-                        token_sold_cur_price = float(token_sold_cur_price)
-                    
-                    # Extract supply
-                    token_sold_supply = token_data.get("supply", "N/A")
-                    if token_sold_supply == "N/A":
-                        token_sold_supply = 0
-                    else:
-                        token_sold_supply = float(token_sold_supply)
-                    
-                    # Extract decimals
-                    token_sold_decimals = token_data.get("decimals", "N/A")
-                    if token_sold_decimals == "N/A":
-                        token_sold_decimals = 0
-                    else:
-                        token_sold_decimals = int(token_sold_decimals)
-                    
-                    # Calculate adjusted supply
-                    if token_sold_supply and token_sold_decimals:
-                        token_sold_supply = token_sold_supply / (10 ** token_sold_decimals)
-                    
-                    # Calculate market caps
-                    last_sell_mc = token_value * sol_cur_price["price_per_token"] * token_sold_supply
-                    token_trade_summary[token_sold_address]['last_sell_mc'] = last_sell_mc
-                    
-                    token_current_mc = token_sold_cur_price * token_sold_supply
-                    token_trade_summary[token_sold_address]['current_mc'] = token_current_mc
-                else:
-                    # Handle case where token data is not available
-                    logger.warning(f"Token data not available for: {token_sold}")
-                    token_trade_summary[token_sold_address]['last_sell_mc'] = None
-                    token_trade_summary[token_sold_address]['current_mc'] = None
-            logger.info(f"case 2")
-            logger.info(f" Token Sold: token_trade_summary[{token_sold_address}]: {token_trade_summary[token_sold_address]}")
-            logger.info(f" Token Bought: token_trade_summary[{token_bought_address}]: {token_trade_summary[token_bought_address]}")
-
-
-        elif token_sold_address != SOL_ADDR and token_bought_address != SOL_ADDR:
-
-            txn_usd_value_chr = transaction.get("txn_usd_value", "$0")
-            usd_value_str = float(txn_usd_value_chr.replace("$", "").replace(",", "")) if txn_usd_value_chr and txn_usd_value_chr.lower() != "n/a" else 0.0
- 
-            def safe_float(value):
-                try:
-                    # Handle if value is already a number or a string number.
-                    return float(value)
-                except (ValueError, TypeError):
-                    return 0.0
-
-            txn_usd_value = safe_float(usd_value_str)
-
-            if sol_cur_price['price_per_token'] and txn_usd_value:
-                sol_amount = txn_usd_value / sol_cur_price['price_per_token']
-            token_trade_summary[token_sold_address]['sells'] += 1
-            token_trade_summary[token_bought_address]['buys'] += 1
-            token_trade_summary[token_sold_address]['total_sell_amount'] += token_sold_amount
-            token_trade_summary[token_bought_address]['total_buy_amount'] += token_bought_amount
-
-            token_trade_summary[token_bought_address]['first_buy_timestamp'] = trade_time_unix
-            token_value = txn_usd_value / token_bought_amount if token_bought_amount else 0
-
-            # Get token_bought data from results instead of token_metadata
-            if token_bought_address in results["results"]:
-                token_data_bought = results["results"][token_bought_address]
-
-                token_base_price = token_data_bought.get("basePrice", "N/A")
-                token_quote_price = token_data_bought.get("quotePrice", "N/A")
-                if token_base_price > token_quote_price:
-                    token_bought_cur_price = token_quote_price
-                else:
-                    token_bought_cur_price = token_base_price
-
-                if token_bought_cur_price == "N/A":
-                    token_bought_cur_price = 0
-                else:
-                    token_bought_cur_price = float(token_bought_cur_price)
-
-                # Extract supply
-                token_bought_supply = token_data_bought.get("supply", 0)
-                if token_bought_supply == "N/A":
-                    token_bought_supply = 0
-                else:
-                    token_bought_supply = float(token_bought_supply)
-
-                # Extract decimals and calculate adjusted supply
-                token_bought_decimals = token_data_bought.get("decimals", 0)
-                if token_bought_decimals == "N/A":
-                    token_bought_decimals = 0
-                else:
-                    token_bought_decimals = int(token_bought_decimals)
-
-                if token_bought_supply and token_bought_decimals:
-                    token_bought_supply = token_bought_supply / (10 ** token_bought_decimals)
-            else:
-                token_bought_cur_price = 0
-                token_bought_supply = 0
-
-            # Compute first buy market cap and current market cap
-            first_buy_mc = token_value * token_bought_supply
-            token_trade_summary[token_bought_address]['first_buy_mc'] = first_buy_mc
-
-            token_current_mc = token_bought_cur_price * token_bought_supply
-            token_trade_summary[token_bought_address]['current_mc'] = token_current_mc
-
-            # Process token_sold data if this is the first sell
-            if token_trade_summary[token_sold_address]['last_sell_timestamp'] is None:
-
-                txn_usd_value_chr = transaction.get("txn_usd_value", "$0")
-                usd_value_str = float(txn_usd_value_chr.replace("$", "").replace(",", "")) if txn_usd_value_chr and txn_usd_value_chr.lower() != "n/a" else 0.0
-    
-                def safe_float(value):
-                    try:
-                        # Handle if value is already a number or a string number.
-                        return float(value)
-                    except (ValueError, TypeError):
-                        return 0.0
-
-                txn_usd_value = safe_float(usd_value_str)
-
-                # txn_usd_value = float(transaction.get('txn_usd_value', 0) or 0)
-                if sol_cur_price['price_per_token'] and txn_usd_value:
-                    sol_amount = txn_usd_value / sol_cur_price['price_per_token']
-
-                token_trade_summary[token_sold_address]['last_sell_timestamp'] = trade_time_unix
-                token_value = txn_usd_value / token_sold_amount if token_sold_amount else 0
-
-                if token_sold_address in results["results"]:
-                    token_data_sold = results["results"][token_sold_address]
-
-                    token_base_price = token_data_sold.get("basePrice", "N/A")
-                    token_quote_price = token_data_sold.get("quotePrice", "N/A")
-                    if token_base_price > token_quote_price:
-                        token_sold_cur_price = token_quote_price
-                    else:
-                        token_sold_cur_price = token_base_price
-
-                    if token_sold_cur_price == "N/A":
-                        token_sold_cur_price = 0
-                    else:
-                        token_sold_cur_price = float(token_sold_cur_price)
-
-                    # Extract supply
-                    token_sold_supply = token_data_sold.get("supply", 0)
-                    if token_sold_supply == "N/A":
-                        token_sold_supply = 0
-                    else:
-                        token_sold_supply = float(token_sold_supply)
-
-                    # Extract decimals and calculate adjusted supply
-                    token_sold_decimals = token_data_sold.get("decimals", 0)
-                    if token_sold_decimals == "N/A":
-                        token_sold_decimals = 0
-                    else:
-                        token_sold_decimals = int(token_sold_decimals)
-
-                    if token_sold_supply and token_sold_decimals:
-                        token_sold_supply = token_sold_supply / (10 ** token_sold_decimals)
-                else:
-                    token_sold_cur_price = 0
-                    token_sold_supply = 0
-
-                last_sell_mc = token_value * token_sold_supply
-                token_trade_summary[token_sold_address]['last_sell_mc'] = last_sell_mc
-
-                token_current_mc = token_sold_cur_price * token_sold_supply
-                token_trade_summary[token_sold_address]['current_mc'] = token_current_mc
-
-            logger.info(f"case 3")
-            logger.info(f" Token Sold: token_trade_summary[{token_sold_address}]: {token_trade_summary[token_sold_address]}")
-            logger.info(f" Token Bought: token_trade_summary[{token_bought_address}]: {token_trade_summary[token_bought_address]}")
-
-
-            token_trade_summary[token_sold_address]['sol_made'] += sol_amount
-            token_trade_summary[token_bought_address]['sol_spent'] += sol_amount
-            total_sol_made += sol_amount
-            total_sol_spent += sol_amount
-            # print("Here 4")
-    
-    total_sol_spent_usd = total_sol_spent * sol_cur_price["price_per_token"]
-    total_sol_made_usd = total_sol_made * sol_cur_price["price_per_token"]
-    profit_loss_usd = total_sol_made_usd - total_sol_spent_usd
-    profit_loss_roi = (profit_loss_usd / total_sol_spent_usd) * 100 if total_sol_spent_usd else 0
-
-    first_transaction_trade_time = relevant_transactions[0]['trade_time_relative'] if relevant_transactions else "N/A"
-    total_buy_counts = 0 
-    average_gas_fee = total_gas_fees / transaction_count if transaction_count else 0
-    average_jito_fee = total_jito_fees / transaction_count if transaction_count else 0
-    # print("Here 4a")
-    
-
-    # Append an empty row
-    ws.append([])
-    # Move to the next row
-    current_row += 1
-    # Add title and header rows
-    ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=14)
-    ws.cell(row=current_row, column=1, value="Token Trade Summary (Buys, Sells, Buy Amount, Sell Amount)").font = Font(size=10, bold=True)
-    ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="center", vertical="center")
-    # Move to the next row
-    current_row += 1
-
-    tokens_with_more_sells_than_buys = 0
-    tokens_with_short_hold_duration = 0
-    total_held_duration_seconds = 0
-    # print("Here 5")
-    
-    token_trade_list = []
-    for token_address, counts in token_trade_summary.items():
-        if counts['buys'] == 0 and counts['sells'] == 0:
-            continue  # Skip tokens with both buy and sell counts of zero
-
-        total_buy_counts += counts['buys']
-        sol_spent_usd = counts['sol_spent'] * sol_cur_price["price_per_token"]
-        sol_made_usd = counts['sol_made'] * sol_cur_price["price_per_token"]
-        pnl_usd = sol_made_usd - sol_spent_usd
-        pnl_roi = (pnl_usd / sol_spent_usd) * 100 if sol_spent_usd else 0
-        
-        hold_duration = "N/A"
-        held_duration_sec = "N/A"
-
-        if counts['sells'] > counts['buys']:
-            tokens_with_more_sells_than_buys += 1
-        if counts['first_buy_timestamp'] and counts['last_sell_timestamp']:
-            hold_duration_seconds = counts['last_sell_timestamp'] - counts['first_buy_timestamp']
-
-            if hold_duration_seconds > 0:
-                total_held_duration_seconds += hold_duration_seconds
-                held_duration_sec = hold_duration_seconds
-                
-                # Calculate the formatted duration
-                days = hold_duration_seconds // (24 * 3600)
-                hours = (hold_duration_seconds % (24 * 3600)) // 3600
-                minutes = (hold_duration_seconds % 3600) // 60
-                seconds = hold_duration_seconds % 60
-                
-                # Create parts array and only add non-zero components
-                time_parts = []
-                if days > 0:
-                    time_parts.append(f"{days} day{'s' if days != 1 else ''}")
-                if hours > 0:
-                    time_parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
-                if minutes > 0:
-                    time_parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-                if seconds > 0:
-                    time_parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
-                
-                # Handle the case when all values are zero
-                if not time_parts:
-                    hold_duration = "0 seconds"
-                else:
-                    hold_duration = ", ".join(time_parts)
-                
-                if hold_duration_seconds < 60:
-                    tokens_with_short_hold_duration += 1
-            elif hold_duration_seconds < 0:
-                hold_duration_seconds = 0
-                hold_duration = "0 seconds"
-                held_duration_sec = 0
-
-            # Check PNL and update streaks
-            if pnl_usd > 0:  # Winning trade
-                current_winning_streak += 1
-                longest_winning_streak = max(longest_winning_streak, current_winning_streak)
-                # Reset losing streak
-                current_losing_streak = 0  
-            elif pnl_usd < 0:  # Losing trade
-                current_losing_streak += 1
-                longest_losing_streak = max(longest_losing_streak, current_losing_streak)
-                # Reset winning streak
-                current_winning_streak = 0  
-            else:
-                # Reset both streaks if it's a break-even trade
-                longest_winning_streak = max(longest_winning_streak, current_winning_streak)
-                longest_losing_streak = max(longest_losing_streak, current_losing_streak)
-                # Reset both current streaks
-                current_winning_streak = 0
-                current_losing_streak = 0
-        else:
-            held_duration_sec = "N/A"
-            hold_duration = "N/A"
-
-        # When processing token_trade_summary
-        token_symbol = token_bought if token_bought_address == token_address else token_sold
-
-        # Or create a dictionary mapping addresses to symbols when processing transactions
-        token_address_to_symbol = {}
-        for transaction in relevant_transactions:
-            token_address_to_symbol[transaction["token_sold_address"]] = transaction["token_sold"]
-            token_address_to_symbol[transaction["token_bought_address"]] = transaction["token_bought"]
-
-        # Then use it later when needed
-        token_symbol = token_address_to_symbol.get(token_address, "N/A")
-
-        if pnl_roi > 0:
-            profitable_trades += 1
-            if pnl_roi > best_trade_roi:
-
-                best_trade_roi = pnl_roi
-                best_trade = {
-                    'token_address': token_address,
-                    'symbol': token_symbol,
-                    'buys': counts['buys'],
-                    'sells': counts['sells'],
-                    'buy_amount': counts['total_buy_amount'],
-                    'sell_amount': counts['total_sell_amount'],
-                    'sol_spent': counts['sol_spent'],
-                    'sol_made': counts['sol_made'],
-                    'first_buy_timestamp': counts['first_buy_timestamp'],
-                    'last_sell_timestamp': counts['last_sell_timestamp'],
-                    'hold_duration': hold_duration,
-                    'held_duration_sec': held_duration_sec,  # Ensure this is included
-                    'profit_loss': counts['sol_made'] - counts['sol_spent'],  # Calculate profit/loss here
-                    'profit_loss_usd': pnl_usd,  # Calculate profit/loss here
-                    'pnl_roi': pnl_roi,
+        print(f"Error checking proxy {proxy}: {e}")
+        return False
+    return False
+
+# Function to process a batch of proxies asynchronously
+async def process_proxies_batch(proxies):
+    tasks = [is_proxy_active(proxy) for proxy in proxies]
+    results = await gather(*tasks)
+    return results
+
+# Function to run async tasks in multiprocessing
+def run_async_batch(batch):
+    loop = new_event_loop()
+    set_event_loop(loop)
+    return loop.run_until_complete(process_proxies_batch(batch))
+
+# Function to process proxies in batches using multiprocessing
+def process_proxies_in_batches(proxies, batch_size=100):
+    batches = [proxies[i:i + batch_size] for i in range(0, len(proxies), batch_size)]
+    active_proxies = []
+
+    with Pool(cpu_count()) as pool:
+        results = pool.map(run_async_batch, batches)
+
+    for batch, result in zip(batches, results):
+        for proxy, active in zip(batch, result):
+            if active:
+                active_proxies.append(proxy)
+
+    return active_proxies
+
+def divide_into_batches(tokens, batch_size):
+    """
+    Splits tokens into smaller batches of specified size.
+    """
+    for i in range(0, len(tokens), batch_size):
+        yield tokens[i:i + batch_size]
+
+# Fetch token metadata with retries
+async def fetch_metadata(session, url, headers, payload, address, proxy_url):
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                async with session.post(url, headers=headers, json=payload, proxy=proxy_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data and 'result' in data:
+                            return address, data.get('result')
+                        else:
+                            print(f"Received empty or invalid data for address {address}")
+                            return address, None
+        except Exception as e:
+            print(f"Attempt {attempt+1}/{MAX_RETRIES} failed for address {address}: {e}")
+            await sleep(SLEEP_TIME)
+    print(f"Failed to fetch metadata for address {address} after {MAX_RETRIES} attempts")
+    return address, None
+
+async def fetch_and_store_metadata(token_addresses, proxy=None):
+    proxy_url = None
+    if proxy:
+        ip, port, username, password = proxy.split(':')
+        proxy_url = f"http://{username}:{password}@{ip}:{port}"
+
+    # Create the aiohttp session with or without proxy
+    async with ClientSession() as session:
+        tasks = []
+        for address in token_addresses:
+            url = GET_ASSET_URL
+            headers = {'Content-Type': 'application/json'}
+            payload = {
+                'jsonrpc': '2.0',
+                'id': 'my-id',
+                'method': 'getAsset',
+                'params': {
+                    'id': address,
+                    'displayOptions': {'showFungible': True}
                 }
-        else:
-            unprofitable_trades += 1
+            }
+            tasks.append(fetch_metadata(session, url, headers, payload, address, proxy_url))
+
+        # Gather all the responses concurrently
+        responses = await gather(*tasks)
+
+        metadata_s = {}
+        for address, metadata in responses:
+            if metadata:  # Ensure metadata is not None
+                metadata_s[address] = metadata
+    return metadata_s
+
+def parse_trade_string_broad(trade_str: str, mint_token: str):
+    """
+    Parses a trade string into its components using flexible pattern matching
+    to handle various formats found on Solscan.
+    
+    Supports multiple formats including:
+      1. Standard: <token_sold_amount><token_sold_symbol><token_bought_amount><mint_token>
+      2. Inverted: <token_sold_amount><mint_token><token_bought_amount><token_bought_symbol>
+      3. Complex formats with numbers and symbols in various positions
+    
+    Args:
+      trade_str (str): The trade string to parse.
+      mint_token (str): The token symbol for the minted token.
+      
+    Returns:
+      dict: A dictionary with keys "token_sold_amount", "token_sold_symbol",
+            "token_bought_amount", and "token_bought_symbol".
+            
+    Raises:
+      ValueError: If the trade string cannot be parsed.
+    """
+    import re
+    
+    # Clean the input string and ensure it's properly formatted
+    trade_str = trade_str.strip()
+    
+    # Helper: clean up number strings (remove commas)
+    def clean_number(num_str: str):
+        return num_str.replace(",", "")
+    
+    # Define regex patterns for various components
+    # Pattern for numbers with optional commas and decimal points
+    number_pattern = r"(?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d+)?"
+    
+    # Pattern for token symbols (letters, numbers, and some special characters)
+    # Including numbers to handle tokens like "39a", "TIМ", etc.
+    token_pattern = r"[A-Za-z0-9$._\-#@!]+"
+    
+    # Escape the mint token for safer regex
+    mint_token_escaped = re.escape(mint_token)
+    
+    # Try to handle the format dynamically by analyzing the string
+    try:
+        # Case 1: Check if the string ends with mint_token
+        if trade_str.endswith(mint_token):
+            # Format: <sold_amount><sold_symbol><bought_amount><mint_token>
+            pattern = rf"^({number_pattern})({token_pattern})({number_pattern})({mint_token_escaped})$"
+            m = re.search(pattern, trade_str)
+            if m:
+                sold_amount_str, sold_token, bought_amount_str = m.group(1), m.group(2), m.group(3)
+                
+                return {
+                    "token_sold_amount": clean_number(sold_amount_str),
+                    "token_sold_symbol": sold_token,
+                    "token_bought_amount": clean_number(bought_amount_str),
+                    "token_bought_symbol": mint_token
+                }
+        
+        # Case 2: Check if mint_token is in the middle of the string
+        pattern = rf"({number_pattern})({mint_token_escaped})({number_pattern})({token_pattern})$"
+        m = re.search(pattern, trade_str)
+        if m:
+            sold_amount_str, bought_amount_str, bought_token = m.group(1), m.group(3), m.group(4)
+            
+            return {
+                "token_sold_amount": clean_number(sold_amount_str),
+                "token_sold_symbol": mint_token,
+                "token_bought_amount": clean_number(bought_amount_str),
+                "token_bought_symbol": bought_token
+            }
+        
+        # Case 3: General method - find all numbers and tokens
+        # Split the string into sequences of digits and non-digits
+        components = re.findall(rf"({number_pattern})|({token_pattern})", trade_str)
+        
+        # Filter out empty matches and flatten
+        parts = [part for group in components for part in group if part]
+        
+        # Check if we have at least 4 parts (2 numbers, 2 tokens)
+        if len(parts) >= 4:
+            # Determine which parts are numbers and which are tokens
+            numbers = []
+            tokens = []
+            
+            for part in parts:
+                # Check if the part is a number (starts with a digit)
+                if re.match(r"^\d", part):
+                    numbers.append(part)
+                else:
+                    tokens.append(part)
+            
+            # If we have 2 numbers and 2 tokens, we can parse
+            if len(numbers) >= 2 and len(tokens) >= 2:
+                # Identify which token is the mint token
+                if mint_token in tokens:
+                    mint_index = tokens.index(mint_token)
+                    other_token_index = 1 - mint_index if len(tokens) == 2 else 0 if mint_index > 0 else 1
+                    
+                    # Determine the order based on positions
+                    if parts.index(tokens[mint_index]) < parts.index(tokens[other_token_index]):
+                        # Format: <sold_amount><mint_token><bought_amount><other_token>
+                        return {
+                            "token_sold_amount": clean_number(numbers[0]),
+                            "token_sold_symbol": mint_token,
+                            "token_bought_amount": clean_number(numbers[1]),
+                            "token_bought_symbol": tokens[other_token_index]
+                        }
+                    else:
+                        # Format: <sold_amount><other_token><bought_amount><mint_token>
+                        return {
+                            "token_sold_amount": clean_number(numbers[0]),
+                            "token_sold_symbol": tokens[other_token_index],
+                            "token_bought_amount": clean_number(numbers[1]),
+                            "token_bought_symbol": mint_token
+                        }
+                else:
+                    # If mint token isn't found in tokens, assume it's the second token position
+                    return {
+                        "token_sold_amount": clean_number(numbers[0]),
+                        "token_sold_symbol": tokens[0],
+                        "token_bought_amount": clean_number(numbers[1]),
+                        "token_bought_symbol": tokens[1] if len(tokens) > 1 else mint_token
+                    }
+                    
+        # Case 4: Special case for more complex patterns
+        # Handle formats like "198,3005.57,667.080378SAG3" where "5.5" is the mint token
+        if mint_token in trade_str:
+            # Split at the mint token
+            parts = trade_str.split(mint_token)
+            if len(parts) == 2:
+                # Get the amounts and symbols
+                # Extract first number from first part
+                first_num_match = re.search(rf"^{number_pattern}", parts[0])
+                if first_num_match:
+                    first_amount = first_num_match.group(0)
+                    
+                    # Extract number and token from second part
+                    second_match = re.search(rf"({number_pattern})({token_pattern})$", parts[1])
+                    if second_match:
+                        second_amount, second_token = second_match.group(1), second_match.group(2)
                         
-        token_trade_list.append((token_address, counts))
-    token_trade_list.sort(key=lambda x: (x[1]['first_buy_timestamp'] is None, x[1]['first_buy_timestamp'] or float('inf')))
-    # print("Here 6")
-
-    headers_2 = [
-    "Token Address", "Buys", "Sells", "Total Buy Amount", 
-    "Total Sell Amount", "PNL (USD)", "PNL ROI (%)", "Held Duration", "First Buy MC (USD)", 
-    "Last Sell MC (USD)", "Current MC (USD)", "Scam Score"
-    ]
-
-    # Apply bold and center alignment for headers
-    for col_num, header in enumerate(headers_2, 1):
-        cell = ws.cell(row=current_row, column=col_num, value=header)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # Start filling data from the second row
-    current_row += 1
-    for token_address, counts in token_trade_list:
-        token_data = results["results"][token_address]
-        scam_score = token_data.get("score_normalised", 0)
+                        return {
+                            "token_sold_amount": clean_number(first_amount),
+                            "token_sold_symbol": mint_token,
+                            "token_bought_amount": clean_number(second_amount),
+                            "token_bought_symbol": second_token
+                        }
         
-
-        if scam_score != "N/A":
-            scam_score = safe_int_conversion(scam_score)
-            if scam_score > 40: 
-                tokens_with_high_scam_score += 1
-        else:
-            scam_score = str("N/A")
-
-        # When processing token_trade_summary
-        token_symbol = token_bought if token_bought_address == token_address else token_sold
-
-        # Or create a dictionary mapping addresses to symbols when processing transactions
-        token_address_to_symbol = {}
-        for transaction in relevant_transactions:
-            token_address_to_symbol[transaction["token_sold_address"]] = transaction["token_sold"]
-            token_address_to_symbol[transaction["token_bought_address"]] = transaction["token_bought"]
-
-        # Then use it later when needed
-        token_symbol = token_address_to_symbol.get(token_address, "N/A")
-
-        total_buy_counts += counts['buys']
-        sol_spent_usd = counts['sol_spent'] * sol_cur_price["price_per_token"]
-        sol_made_usd = counts['sol_made'] * sol_cur_price["price_per_token"]
-        pnl_usd = sol_made_usd - sol_spent_usd
-        pnl_roi = (pnl_usd / sol_spent_usd) * 100 if sol_spent_usd else 0
-        
-        if counts['first_buy_timestamp'] and counts['last_sell_timestamp']:
-            hold_duration_seconds = counts['last_sell_timestamp'] - counts['first_buy_timestamp']
-            if hold_duration_seconds > 0:
-                total_held_duration_seconds += hold_duration_seconds
-            elif hold_duration_seconds < 0:
-                hold_duration_seconds = 0
-                
-            if hold_duration_seconds > 0 and hold_duration_seconds < 60:
-                tokens_with_short_hold_duration += 1
-
-            if hold_duration_seconds > 0:
-                days = hold_duration_seconds // (24 * 3600)
-                hours = (hold_duration_seconds % (24 * 3600)) // 3600
-                minutes = (hold_duration_seconds % 3600) // 60
-                seconds = hold_duration_seconds % 60
-                
-                # Create parts array and only add non-zero components
-                time_parts = []
-                if days > 0:
-                    time_parts.append(f"{days} day{'s' if days != 1 else ''}")
-                if hours > 0:
-                    time_parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
-                if minutes > 0:
-                    time_parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-                if seconds > 0:
-                    time_parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
-                
-                # Handle the case when all values are zero
-                if not time_parts:
-                    hold_duration = "0 seconds"
-                else:
-                    hold_duration = ", ".join(time_parts)
-
-            # days = hold_duration_seconds // (24 * 3600)
-            # hours = (hold_duration_seconds % (24 * 3600)) // 3600
-            # minutes = (hold_duration_seconds % 3600) // 60
-            # seconds = hold_duration_seconds % 60
-            # held_duration_sec = hold_duration_seconds
-            # hold_duration = f"{days} days, {hours} hours, {minutes} minutes, {seconds} seconds"   
+        # Last resort: Try to extract structured data from the unstructured string
+        nums = re.findall(number_pattern, trade_str)
+        if len(nums) >= 2:
+            # Extract token symbols by removing numbers, common separators, and whitespace
+            remaining = re.sub(rf"{number_pattern}|[,.\s]", " ", trade_str).strip()
+            tokens_found = re.findall(r"[A-Za-z0-9$]+", remaining)
             
-            # Check PNL and update streaks
-            if pnl_usd > 0:  # Winning trade
-                current_winning_streak += 1
-                longest_winning_streak = max(longest_winning_streak, current_winning_streak)
-                # Reset losing streak
-                current_losing_streak = 0  
-            elif pnl_usd < 0:  # Losing trade
-                current_losing_streak += 1
-                longest_losing_streak = max(longest_losing_streak, current_losing_streak)
-                # Reset winning streak
-                current_winning_streak = 0  
+            if len(tokens_found) >= 1:
+                # If mint_token matches one of the found tokens
+                if mint_token in tokens_found:
+                    other_tokens = [t for t in tokens_found if t != mint_token]
+                    other_token = other_tokens[0] if other_tokens else "UNKNOWN"
+                    
+                    # Determine order based on position in the original string
+                    if trade_str.find(mint_token) < trade_str.find(other_token):
+                        return {
+                            "token_sold_amount": clean_number(nums[0]),
+                            "token_sold_symbol": mint_token,
+                            "token_bought_amount": clean_number(nums[1]),
+                            "token_bought_symbol": other_token
+                        }
+                    else:
+                        return {
+                            "token_sold_amount": clean_number(nums[0]),
+                            "token_sold_symbol": other_token,
+                            "token_bought_amount": clean_number(nums[1]),
+                            "token_bought_symbol": mint_token
+                        }
+                else:
+                    # If mint_token not found, make best guess based on position
+                    if len(tokens_found) >= 2:
+                        return {
+                            "token_sold_amount": clean_number(nums[0]),
+                            "token_sold_symbol": tokens_found[0],
+                            "token_bought_amount": clean_number(nums[1]),
+                            "token_bought_symbol": tokens_found[1]
+                        }
+                    else:
+                        # Assume the only token found is the sold token
+                        return {
+                            "token_sold_amount": clean_number(nums[0]),
+                            "token_sold_symbol": tokens_found[0],
+                            "token_bought_amount": clean_number(nums[1]),
+                            "token_bought_symbol": mint_token
+                        }
+        
+        # If we reach here, we couldn't parse the trade string
+        raise ValueError(f"Could not parse trade string: '{trade_str}' with mint token '{mint_token}'")
+        
+    except Exception as e:
+        # Provide detailed error for debugging
+        raise ValueError(f"Error parsing trade string '{trade_str}': {str(e)}")
+
+async def save_accumulated_data(mint_address, all_data):
+    """Save all accumulated data to a single file after each page"""
+    os.makedirs("results", exist_ok=True)
+    output_path = f"results/{mint_address}_data.json"
+    
+    # Use a temporary file to prevent data loss if the save operation is interrupted
+    temp_path = f"{output_path}.temp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(all_data, f, indent=4)
+    
+    # Rename the temp file to the final file name
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    os.rename(temp_path, output_path)
+    
+    logger.info(f"Updated data saved to {output_path} ({len(all_data)} total records)")
+
+async def load_existing_data(mint_address):
+    """Load any existing data to continue where we left off"""
+    output_path = f"results/{mint_address}_data.json"
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+                logger.info(f"Loaded {len(existing_data)} existing records from {output_path}")
+                return existing_data
+        except json.JSONDecodeError:
+            logger.warning(f"Could not parse existing data file {output_path}, starting fresh")
+    return []
+
+async def process_row(row, row_index, mint_address, check_symbol):
+    """Process a single table row and extract data concurrently"""
+    if row_index == 0:  # Skip header row
+        return None
+    
+    cells = row.locator("td")
+    cell_count = await cells.count()
+
+     # Helper: clean up number strings (remove commas)
+    def clean_number(num_str: str):
+        return num_str.replace(",", "")
+    
+    
+    # Create tasks to extract all cell text content in parallel
+    cell_text_tasks = []
+    for j in range(cell_count):
+        cell = cells.nth(j)
+        cell_text_tasks.append(cell.text_content())
+    
+    # Await all cell text tasks simultaneously
+    cell_texts_raw = await gather(*cell_text_tasks)
+    cell_texts = [text.strip() for text in cell_texts_raw]
+    
+    # Default values in case extraction fails
+    sell_amount = sell_symbol = buy_amount = buy_symbol = "N/A"
+    
+    # Parse amounts and symbols from cell index 5
+    if len(cell_texts) > 5:
+        try:
+            amount_cell = cells.nth(5)
+            container = amount_cell.locator("div.flex.flex-col.gap-1.items-stretch.justify-start")
+            row_inner = container.locator("div.flex.gap-1.flex-row.items-center.justify-start.flex-nowrap")
+            
+            # Create tasks for parallel extraction of all needed elements
+            extraction_tasks = [
+                amount_cell.text_content(),  # full text content
+                row_inner.locator("div").nth(0).text_content(),  # sell amount
+                row_inner.locator("span.whitespace-nowrap").nth(0).locator("a").text_content(),  # sell symbol
+                row_inner.locator("span.whitespace-nowrap").nth(1).locator("a").text_content()  # buy symbol
+            ]
+            
+            # Execute all extraction tasks in parallel
+            results = await gather(*extraction_tasks)
+            
+            # Parse the results
+            full_text = results[0].strip()
+            sell_amount = results[1].strip()
+            sell_symbol = results[2].strip()
+            buy_symbol = results[3].strip()
+            
+            # Extract buy amount by removing known parts
+            temp = full_text.replace(sell_amount, "", 1)
+            temp = temp.replace(sell_symbol, "", 1)
+            temp = temp.replace(buy_symbol, "", 1)
+            buy_amount = temp.strip()
+
+            
+            
+            logger.info(f"Sell Amount: {sell_amount}, Sell Symbol: {sell_symbol}, Buy Amount: {buy_amount}, Buy Symbol: {buy_symbol}")
+        except Exception as e:
+            logger.warning(f"Failed to parse buy/sell info on row {row_index}: {e}")
+    
+    signature = cell_texts[1] if len(cell_texts) > 1 else "N/A"
+    trade_time = cell_texts[2] if len(cell_texts) > 2 else "N/A"
+    transaction_by = cell_texts[4] if len(cell_texts) > 4 else "N/A"
+    txn_usd_value_s = cell_texts[6] if len(cell_texts) > 6 else "N/A"
+    token_sold_amount = clean_number(sell_amount)
+    token_sold = sell_symbol
+    token_bought_amount = clean_number(buy_amount)
+    token_bought = buy_symbol
+    txn_usd_value = clean_number(txn_usd_value_s)
+    
+    # Clean extracted data
+    signature = signature.strip()
+    trade_time = trade_time.strip()
+    transaction_by = transaction_by.strip()
+    txn_usd_value = txn_usd_value.strip()
+
+    # Construct the row data dictionary
+    txn_dict = {
+        "mint_addr": mint_address,
+        "signature": signature,
+        "trade_time": trade_time,
+        "transaction_by": transaction_by,
+        "token_sold": token_sold,
+        "token_sold_amount": token_sold_amount,
+        "token_bought": token_bought,
+        "token_bought_amount": token_bought_amount,
+        "txn_usd_value": txn_usd_value,
+        "mint_symbol": check_symbol,
+    }
+    
+    return txn_dict
+
+async def process_rows_in_batches(rows, mint_address, check_symbol, batch_size=100):
+    """Process table rows in parallel batches for faster extraction with timing metrics"""
+    row_count = len(rows)
+    all_transactions = []
+    total_batch_time = 0
+    
+    logger.info(f"Starting batch processing of {row_count} rows with batch size {batch_size}")
+    
+    # Process rows in batches
+    for start_idx in range(0, row_count, batch_size):
+        batch_start_time = time.time()
+        
+        end_idx = min(start_idx + batch_size, row_count)
+        batch_tasks = []
+        
+        for row_idx in range(start_idx, end_idx):
+            batch_tasks.append(process_row(rows[row_idx], row_idx, mint_address, check_symbol))
+        
+        batch_results = await gather(*batch_tasks)
+        valid_results = [result for result in batch_results if result]
+        all_transactions.extend(valid_results)
+        
+        batch_end_time = time.time()
+        batch_duration = batch_end_time - batch_start_time
+        total_batch_time += batch_duration
+        
+        # Log batch timing information
+        batch_size_actual = end_idx - start_idx
+        rows_per_second = batch_size_actual / batch_duration if batch_duration > 0 else 0
+        logger.info(f"Batch {start_idx // batch_size + 1}: Processed {len(valid_results)}/{batch_size_actual} rows in {batch_duration:.2f}s ({rows_per_second:.2f} rows/s)")
+    
+    # Log overall batch processing metrics
+    avg_time_per_row = total_batch_time / row_count if row_count > 0 else 0
+    logger.info(f"Completed processing {row_count} rows in {total_batch_time:.2f}s (avg {avg_time_per_row:.4f}s per row)")
+    
+    return all_transactions
+
+proxy_config = {
+    "server": "unblock.oxylabs.io:60000",
+    "username": "devras_fcwXF",
+    "password": "Keepmyoxysafe1+"
+}
+
+async def fetch_transactions_batch(session, batch, url, headers, proxy):
+    """Fetch transactions for a single batch asynchronously."""
+    body = {"transactions": batch}
+    try:
+        async with session.post(url, json=body, headers=headers, proxy=proxy, timeout=10) as response:
+            if response.status == 200:
+                return await response.json()
             else:
-                # Reset both streaks if it's a break-even trade
-                longest_winning_streak = max(longest_winning_streak, current_winning_streak)
-                longest_losing_streak = max(longest_losing_streak, current_losing_streak)
-                # Reset both current streaks
-                current_winning_streak = 0
-                current_losing_streak = 0
-        else:
-            held_duration_sec = "N/A"
-            hold_duration = "N/A"
-        
-        mc_value = counts['first_buy_mc']
-
-        if mc_value is not None:
-            try:
-                mc_value = float(mc_value)  # Ensure it's a number (float or int)
-                if mc_value < 5000:
-                    mc_categories["<5K"] += 1
-                elif 5000 <= mc_value < 30000:
-                    mc_categories["5K-30K"] += 1
-                elif 30000 <= mc_value < 100000:
-                    mc_categories["30K-100K"] += 1
-                elif 100000 <= mc_value < 300000:
-                    mc_categories["100K-300K"] += 1
-                else:
-                    mc_categories["300K+"] += 1
-            except ValueError:
-                # Handle case where mc_value is not convertible to a number
-                print(f"Warning: Market Cap value '{mc_value}' is not a valid number, skipping this token.")
-        else:
-            # Handle case where mc_value is None
-            print(f"warning: Market Cap value is None, skipping this token {token_address}.")    
-    
-
-        # Ensure that the values are not None, and replace None with a default value (e.g., 0.0)
-        first_buy_mc = counts.get('first_buy_mc', 0.0) if counts.get('first_buy_mc') is not None else 0.0
-        last_sell_mc = counts.get('last_sell_mc', 0.0) if counts.get('last_sell_mc') is not None else 0.0
-        current_mc = counts.get('current_mc', 0.0) if counts.get('current_mc') is not None else 0.0
-
-        # Format the values to 2 decimal places, ensuring no scientific notation
-        formatted_first_buy_mc = f" {first_buy_mc:.2f} "
-        formatted_last_sell_mc = f" {last_sell_mc:.2f} "
-        formatted_current_mc = f" {current_mc:.2f} "
-
-        ws.append([
-            f"{token_address} ({token_symbol})",
-            counts['buys'],
-            counts['sells'],
-            counts['total_buy_amount'],
-            counts['total_sell_amount'],
-            f"{pnl_usd:.2f}",
-            f"{pnl_roi:.2f}",
-            hold_duration,
-            formatted_first_buy_mc,
-            formatted_last_sell_mc,
-            formatted_current_mc,
-            scam_score
-        ])
-
-        for col in range(1, len(headers_2) + 1):
-            cell = ws.cell(row=current_row, column=col)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        # Apply specific coloring for PNL (USD)
-        if pnl_usd > 0:
-            ws.cell(row=current_row, column=6).fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")  # Green
-        elif pnl_usd < 0:
-            ws.cell(row=current_row, column=6).fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")  # Light Red
-        elif pnl_usd == 0:
-            ws.cell(row=current_row, column=6).fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")  # Light Green
-
-        # Apply specific coloring for PNL (ROI)
-        if pnl_roi > 0:
-            ws.cell(row=current_row, column=7).fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")  # Green
-        elif pnl_roi < 0:
-            ws.cell(row=current_row, column=7).fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")  # Light Red
-        elif pnl_roi == 0:
-            ws.cell(row=current_row, column=7).fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")  # Light Green
-
-        # Highlight Scam Score
-        if scam_score != "N/A":
-            scam_score = int(scam_score) if str(scam_score).isdigit() else 0  # Ensure it's an integer
-            if scam_score > 40:
-                ws.cell(row=current_row, column=12).fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")  # Red
-            elif scam_score == 40:
-                ws.cell(row=current_row, column=12).fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")  # Yellow
-            elif scam_score == 0:
-                ws.cell(row=current_row, column=12).fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")  # Green
-            elif scam_score < 40:
-                ws.cell(row=current_row, column=12).fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")  # Light Green
-        else:
-            # If scam score is "N/A", handle accordingly, e.g., apply a neutral color or leave it empty
-            ws.cell(row=current_row, column=12).value = "N/A"
-            ws.cell(row=current_row, column=12).alignment = Alignment(horizontal="center", vertical="center")
-
-        # Apply coloring for counts['sells']
-        if counts['sells'] > 15:
-            ws.cell(row=current_row, column=3).fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")  # Red
-        elif counts['sells'] > 4:
-            ws.cell(row=current_row, column=3).fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")  # Light Red
-        elif counts['sells'] < 4:
-            ws.cell(row=current_row, column=3).fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")  # Light Green
-        elif counts['sells'] == 0:
-            ws.cell(row=current_row, column=3).fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")  # Green
-
-        current_row += 1
-    print("here 8")
-
-    def format_duration(seconds):
-        """Format seconds into a human-readable duration string showing only non-zero parts."""
-        if seconds == 0:
-            return "0 seconds"
-            
-        days = int(seconds // (24 * 3600))
-        hours = int((seconds % (24 * 3600)) // 3600)
-        minutes = int((seconds % 3600) // 60)
-        seconds = int(seconds % 60)
-        
-        parts = []
-        if days > 0:
-            parts.append(f"{days} day{'s' if days != 1 else ''}")
-        if hours > 0:
-            parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
-        if minutes > 0:
-            parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-        if seconds > 0:
-            parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
-        
-        return ", ".join(parts)
-
-    average_held_duration_seconds = total_held_duration_seconds / total_buy_counts if total_buy_counts else 0
-    avg_hld_tme = format_duration(average_held_duration_seconds)
-
-    number_of_tokens_traded = profitable_trades + unprofitable_trades
-    average_buy_size = total_sol_spent / number_of_tokens_traded
-    average_trades_per_day = number_of_tokens_traded / analyses_period if analyses_period else 0
-
-    winrate = (profitable_trades / number_of_tokens_traded) * 100 if number_of_tokens_traded else 0
-    average_buy_per_trade = total_buy_counts / number_of_tokens_traded if number_of_tokens_traded else 0
-    
-    # Final check after processing all trades
-    longest_winning_streak = max(longest_winning_streak, current_winning_streak)
-    longest_losing_streak = max(longest_losing_streak, current_losing_streak)
-    
-    print("here 9")
-    # Now add the Best Trade section
-    if best_trade:
-        ws.append([])
-        # Move to the next row
-        current_row += 1
-        # Add title and header rows
-        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=14)
-        ws.cell(row=current_row, column=1, value="Best Trade Based on ROI").font = Font(size=10, bold=True)
-        ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="center", vertical="center")
-        # Move to the next row
-        current_row += 1
-
-        # Best Trade Information
-        headers_3 = [
-        "Token Address", "Token Symbol", "Buys/Sells", "Total Buy Amount", 
-        "Total Sell Amount", "SOL Spent", "SOL made", "Held Duration", "Profit made (SOL)", "Profit made (USD)", "Profit ROI" 
-        ]
-
-        # Apply bold and center alignment for headers
-        for col_num, header in enumerate(headers_3, 1):
-            cell = ws.cell(row=current_row, column=col_num, value=header)
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        current_row += 1
-        ws.append([
-            best_trade['token_address'],
-            best_trade['symbol'],
-            f"{best_trade['buys']}/{best_trade['sells']}",
-            f"{best_trade['buy_amount']:.2f} {best_trade['symbol']}",
-            f"{best_trade['sell_amount']:.2f} {best_trade['symbol']}",
-            f"{best_trade['sol_spent']:.9f} SOL",
-            f"{best_trade['sol_made']:.9f} SOL",
-            best_trade['hold_duration'],
-            f"{best_trade['profit_loss']:.9f} SOL",
-            f"${best_trade['profit_loss_usd']:.2f}",
-            f"{best_trade['pnl_roi']:.2f}%" 
-        ])
-        
-        for col in range(1, len(headers_3) + 1):
-            cell = ws.cell(row=current_row, column=col)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-
-        current_row += 1
-    
-    print("here 10")
-    ws.append([])
-    # Move to the next row
-    current_row += 1
-    # Add title and header rows
-    ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=14)
-    ws.cell(row=current_row, column=1, value="Overall Wallet Summary").font = Font(size=10, bold=True)
-    ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="center", vertical="center")
-    # Move to the next row
-    current_row += 1
-    
-    # Center the text in the cells
-    if sol_balance is not None:
-        sol_balance = get_sol_balance(address, proxy)  # sol_balance is a dictionary
-        sol_balance_value = sol_balance.get("balance", 0.0)  # Extract the float value  
-        ws.append(["SOL Balance", f"{sol_balance_value:.9f} SOL"])  # Now it's correctly formatted
-        ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center", vertical="center")
-
-    ws.append([])
-    current_row += 4
-    ws.append(["Number of Tokens Traded", number_of_tokens_traded])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center", vertical="center")
-    ws.append(["Profitable Trades", profitable_trades])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center", vertical="center")
-    ws.append(["Unprofitable Trades", unprofitable_trades])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center", vertical="center")
-    ws.append(["Winrate", f"{winrate:.2f}%"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center", vertical="center")
-    ws.append(["Average Buy Size", f"{average_buy_size:.2f} SOL"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center", vertical="center")
-
-    ws.append([])
-    current_row += 1
-
-    ws.append(["Average Held Duration", avg_hld_tme])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Average Buys per Trade", f"{average_buy_per_trade:.2f}"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Average Trades per Day", f"{average_trades_per_day:.2f}"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Last Trade Time", first_transaction_trade_time])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-
-    ws.append([])
-    current_row += 5
-    ws.append(["Average Buy Size (SOL)", f"{average_buy_size:.2f}"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Total Gas Fees", f"{total_gas_fees:.9f} SOL"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Average Gas Fee per Transaction", f"{average_gas_fee:.9f} SOL"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-
-    ws.append(["Total Jito Fees", f"{total_jito_fees:.9f} SOL"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Average Jito Fee per Transaction", f"{average_jito_fee:.9f} SOL"])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-
-    profit_loss = total_sol_made - total_sol_spent
-
-    # Create a summary section
-    ws.append([])
-    current_row += 5
-    ws.append(["Total SOL Spent", total_sol_spent])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Total SOL Made", total_sol_made])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    # ws.append(["Total Gas Fees (SOL)", total_gas_fees])
-    # ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    # ws.append(["Total Jito Fees (SOL)", total_jito_fees])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Transaction Count", transaction_count])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-
-    ws.append([])
-    current_row += 3
-    ws.append(["Tokens with More Sells than Buys", tokens_with_more_sells_than_buys])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Tokens with Short Hold Duration (< 1 min)", tokens_with_short_hold_duration])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Scam Tokens", tokens_with_high_scam_score])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-
-    # Streak results
-    ws.append([])
-    current_row += 2
-    ws.append(["Longest Winning Streak", longest_winning_streak])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-    ws.append(["Longest Losing Streak", longest_losing_streak])
-    ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-
-    ws.append([])
-    # Move to the next row
-    current_row += 12
-    # Add title and header rows
-    ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=14)
-    ws.cell(row=current_row, column=1, value="Market Capitalization Distribution of Tokens").font = Font(size=10, bold=True)
-    ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="center", vertical="center")
-    # Move to the next row
-    current_row += 1
-
-    for category, count in mc_categories.items():
-        ws.append([category, f"{count} tokens"])
-        ws.cell(row=current_row, column=2).alignment = Alignment(horizontal="center")
-
-    # Apply bold formatting to the header row
-    # for cell in ws[ws.max_row-1]:
-    #     cell.font = Font(bold=True)
-    
-    # Assuming you have the relevant variables defined
-    wallet_summary = generate_wallet_summary(
-        sol_balance_value, number_of_tokens_traded, profitable_trades,
-        unprofitable_trades, winrate, avg_hld_tme, average_buy_per_trade, average_trades_per_day,
-        first_transaction_trade_time, average_buy_size, total_sol_spent_usd, total_sol_spent, 
-        total_sol_made_usd, total_sol_made, profit_loss, profit_loss_usd, profit_loss_roi, tokens_with_more_sells_than_buys, 
-        tokens_with_short_hold_duration, tokens_with_high_scam_score, longest_winning_streak, longest_losing_streak, total_gas_fees, average_gas_fee,
-        total_jito_fees, average_jito_fee, address, analyses_period, mc_categories
-    )
-
-    best_trade_summary = generate_best_trade(best_trade)
-    print("here 10")
-    # Send the summaries to the user
-    full_message = f"{wallet_summary}\n\n{best_trade_summary}"
-
-    # Apply bold and center alignment for summary
-    for cell in ws["E"]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center")
-
-    # Calculate the maximum length of the content in each column
-    max_lengths = {col: 0 for col in range(1, len(headers) + 1)}
-
-    # Loop through the rows and find the maximum length of each column
-    for row in ws.iter_rows(min_row=2, max_row=current_row - 1, min_col=1, max_col=len(headers)):
-        for col_num, cell in enumerate(row, start=1):
-            try:
-                # Update the max length for the current column
-                if cell.value:
-                    max_lengths[col_num] = max(max_lengths[col_num], len(str(cell.value)))
-            except:
-                continue
-
-    # Set the column widths based on the max lengths
-    for col_num, max_len in max_lengths.items():
-        # Add some padding for better readability (adjust the multiplier as needed)
-        adjusted_width = max_len + 2
-        col_letter = openpyxl.utils.get_column_letter(col_num)
-        ws.column_dimensions[col_letter].width = adjusted_width
-
-    # Save to a file
-    file_path = f"full_trade_analysis_{address}.xlsx"
-    wb.save(file_path)
-    
-    # Send the full message and attach the Excel file in one reply
-    with open(file_path, "rb") as f:
-        await update.message.reply_text(full_message)  # First, send the text message
-        await update.message.reply_document(document=f, filename=f"full_trade_analysis_{address}.xlsx")  # Then, send the document
-
-    print(f"Transaction analysis sent to the bot for address: {address}")
-
-# Function to generate top trader
-# Function to generate top trader
-# Function to generate top trader
-
-async def generate_top_trader_file(update, r, mint_address, relevant_transactions, proxy):
-    sol_cur_price = await get_asset(SOL_ADDR, proxy)
-
-    # Track traders' stats
-    trader_stats = defaultdict(lambda: {
-        "buy_count": 0,
-        "sell_count": 0,
-        "sol_buy_amount": 0.0,
-        "sol_sell_amount": 0.0,
-        "pnl_sol": 0.0,
-        "pnl_usd": 0.0,
-        "roi_percent": 0.0
-    })
-
-    # Token metadata processing
-    token_addresses = set()
-
-
-    transactions_list = relevant_transactions
-    
-    for transaction in transactions_list:
-        token_sold = transaction.get("token_sold")
-        token_bought = transaction.get("token_bought")
-
-        token_addresses.add(token_sold)
-        token_addresses.add(token_bought)
-    
-    # Initialize Excel workbook
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = f"Trade - {mint_address[:10]}"
-
-    # Title and headers for transactions section
-    ws.merge_cells('A1:N1')
-    ws['A1'] = f"Trade Analysis of Wallet {mint_address}"
-    ws['A1'].font = Font(size=16, bold=True)
-    ws['A1'].alignment = Alignment(horizontal="center", vertical="center")
-
-    # Add transaction headers
-    headers = [
-        "Signature", "Transaction by", "Token Bought", "Token Bought Amount", 
-        "Token Sold", "Token Sold Amount", "Trade Time", "USD WORTH (USD)"
-    ]
-    ws.append(headers)
-    header_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    for cell in ws[2]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    # Populate transaction data and update trader stats
-    current_row = 3
-    
-    # transactions_list = relevant_transactions.get("transactions", [])
-    for transaction in transactions_list:
-        trader = transaction.get("transaction_by")
-        token_sold = transaction.get("token_sold")
-        mint_symbol = transaction.get("mint_symbol")
-        token_bought = transaction.get("token_bought")
-        
-        txn_usd_value_chr = transaction.get("txn_usd_value", "$0")
-        usd_value_str = float(txn_usd_value_chr.replace("$", "").replace(",", "")) if txn_usd_value_chr and txn_usd_value_chr.lower() != "n/a" else 0.0
-
-        # txn_usd_value = float(transaction.get('txn_usd_value', 0) or 0)
-        def safe_float(value):
-            try:
-                # Handle if value is already a number or a string number.
-                return float(value)
-            except (ValueError, TypeError):
-                return 0.0
-
-        # Then use:
-        token_sold_amount = safe_float(transaction.get('token_sold_amount', 0))
-        token_bought_amount = safe_float(transaction.get('token_bought_amount', 0))
-        # usd_value = safe_float(transaction.get('txn_usd_value', 0))
-        usd_value = safe_float(usd_value_str)
-
-        print(f"Updating Trader Stats: {transaction}")
-        # Update trader stats
-        if token_sold in ["WSOL", "SOL"]:
-            trader_stats[trader]["buy_count"] += 1
-            trader_stats[trader]["sol_buy_amount"] += token_sold_amount
-        elif token_bought in ["WSOL", "SOL"]:
-            trader_stats[trader]["sell_count"] += 1
-            trader_stats[trader]["sol_sell_amount"] += token_bought_amount
-            
-            print(f"Updating Trader Stats for SOL: {transaction}")
-
-        # if token_sold not in ["WSOL", "SOL"] and token_sold != mint_symbol:
-        #     trader_stats[trader]["buy_count"] += 1
-        #     sol_equivalent = usd_value / sol_cur_price["price_per_token"]
-        # elif token_bought not in ["WSOL", "SOL"] and token_bought != mint_symbol:
-        #     trader_stats[trader]["sell_count"] += 1
-        #     sol_equivalent = usd_value / sol_cur_price["price_per_token"]
-        #     trader_stats[trader]["sol_sell_amount"] += sol_equivalent
-        
-        if token_sold not in ["WSOL", "SOL"] and token_sold == mint_symbol:
-            trader_stats[trader]["buy_count"] += 1
-            sol_equivalent = usd_value / sol_cur_price["price_per_token"]
-            trader_stats[trader]["sol_buy_amount"] += sol_equivalent
-        elif token_bought not in ["WSOL", "SOL"] and token_bought == mint_symbol:
-            trader_stats[trader]["sell_count"] += 1
-            sol_equivalent = usd_value / sol_cur_price["price_per_token"]
-            trader_stats[trader]["sol_sell_amount"] += sol_equivalent
-        
-            print(f"Updating Trader Stats for TOKEN: {transaction}")
-
-        ws.append([
-            transaction['signature'],
-            trader,
-            f"{token_bought}",
-            transaction['token_bought_amount'],
-            f"{token_sold}",
-            transaction['token_sold_amount'],
-            transaction['trade_time'],
-            usd_value
-        ])
-        current_row += 1
-
-    # Sort traders by ROI
-    for trader, stats in trader_stats.items():
-        # Calculate PNL (SOL)
-        stats["pnl_sol"] = stats["sol_sell_amount"] - stats["sol_buy_amount"]
-
-        # Calculate PNL (USD)
-        # stats["pnl_usd"] = stats["pnl_sol"] * sol_cur_price
-        stats["pnl_usd"] = stats["pnl_sol"] * sol_cur_price["price_per_token"]
-
-        # Calculate ROI (%)
-        stats["roi_percent"] = (
-            (stats["pnl_sol"] / stats["sol_buy_amount"]) * 100
-            if stats["sol_buy_amount"] > 0
-            else 0
-        )
-
-    sorted_traders = sorted(
-        trader_stats.items(),
-        key=lambda x: x[1]["pnl_usd"],
-        reverse=True
-    )
-
-    # Add Top Traders section
-    ws.merge_cells(start_row=current_row + 2, start_column=1, end_row=current_row + 2, end_column=6)
-    ws.cell(row=current_row + 2, column=1, value="Top Traders").font = Font(size=14, bold=True)
-    ws.cell(row=current_row + 2, column=1).alignment = Alignment(horizontal="center", vertical="center")
-
-    trader_headers = ["Top Trader", "Buy Count", "Sell Count", 
-                      "Total SOLs Spent", "Total SOLs Made", "PNL (SOL)", "PNL (USD)", "ROI (%)"]
-    ws.append(trader_headers)
-    header_fill = PatternFill(start_color="CCCCFF", end_color="CCCCFF", fill_type="solid")
-    for cell in ws[current_row + 3]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    # Populate Top Traders data
-    current_row += 4
-    for trader, stats in sorted_traders:
-        ws.append([
-            trader,
-            stats["buy_count"],
-            stats["sell_count"],
-            round(stats["sol_buy_amount"], 4),
-            round(stats["sol_sell_amount"], 4),
-            round(stats["pnl_sol"], 4),
-            f"${stats['pnl_usd']:.2f}",
-            f"{round(stats['roi_percent'], 2)}%"
-        ])
-        current_row += 1
-
-    # Save Excel file
-    file_path = f"full_trade_analysis_{mint_address}.xlsx"
-    wb.save(file_path)
-
-    # Send file to the user
-    with open(file_path, "rb") as f:
-        await update.message.reply_document(document=f, filename=f"full_trade_analysis_{mint_address}.xlsx")
-
-    print(f"Transaction analysis sent to the bot for token: {mint_address}")
-     
-async def fetch_token_data_from_server(update, token_mint, active_proxies):
-    """
-    Sends token list and proxies to Flask server for processing.
-    """
-    checkScamTokensurl = f"{SERVER_URL}/checkScamTokens"  # Replace with your actual server URL
-
-    payload = {
-        "tokens": token_mint,
-        "proxies": active_proxies
-    }
-
-    # Send an immediate acknowledgment to the user
-    status_message = await update.message.reply_text(
-        f"Checking Rugproof..... This may take several minutes..."
-    )
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(checkScamTokensurl, json=payload) as resp:
-            if resp.status != 202:
-                await status_message.edit_text(
-                    "Failed to start transaction processing. Please try again later."
-                )
-                return
-            data = await resp.json()
-            task_id = data.get("task_id")
-    
-    transactions = None
-    while True:
-         async with aiohttp.ClientSession() as session:
-             async with session.get(f"{SERVER_URL}/task_status/{task_id}") as resp:
-                 data = await resp.json()
-                 if data.get("state") == "SUCCESS":
-                    transactions = data.get("result")
-                    # Update the status message when done
-                    await status_message.edit_text("Processing complete, fetching results...")
-                    break
-                 elif data.get("state") == "FAILURE":
-                    await status_message.edit_text(
-                        "Transaction processing failed. Please try again later."
-                    )
-                    return
-         # Wait before polling again (e.g., 5 seconds)
-         await sleep(5)
-    
-    # Once the background task completes, process the results
-    if transactions:
-       return transactions
-    else:
-        await update.message.reply_text("No relevant transactions.")
-        return
-
-async def get_asset(sol_address, proxy):
-    getAsseturl = f"{SERVER_URL}/get_asset"  # Replace with your actual server IP
-
-    payload = {
-        "sol_address": sol_address,
-        "proxy": proxy
-    }
-
-    # Use aiohttp to make an async POST request
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(getAsseturl, json=payload) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    print(f"Error from server: {response.status}, {await response.text()}")
-                    return {"error": f"Server returned status {response.status}"}
-        except Exception as e:
-            print(f"Error sending request at get_asset: {e}")
-            return {"error": "Request failed"}
-
-async def fetch_account_transactions_from_server_wal(update, address, proxies, analyses_period, active_proxies, proxy):
-    start_time = time.time()
-    fetchAccountTransurl = f"{SERVER_URL}/fetchAccountTrans"
-
-    # Send an immediate acknowledgment to the user
-    status_message = await update.message.reply_text(
-        f"Fetching transactions for {address}. This may take several minutes..."
-    )
-
-    payload = {
-        "address": address,
-        "proxies": proxies,
-        "analyses_period": analyses_period,
-        "active_proxies": active_proxies
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(fetchAccountTransurl, json=payload) as resp:
-            if resp.status != 202:
-                await status_message.edit_text("Failed to start transaction processing. Please try again later.")
-                return
-            data = await resp.json()
-            task_id = data.get("task_id")
-        
-    transactions = None
-    while True:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{SERVER_URL}/task_status/{task_id}") as resp:
-                data = await resp.json()
-                if data.get("state") == "SUCCESS":
-                    transactions = data.get("result")
-                    # Update status message once done
-                    await status_message.edit_text("Transaction processing complete. Processing results...")
-                    break
-                elif data.get("state") == "FAILURE":
-                    await status_message.edit_text("Transaction processing failed. Please try again later.")
-                    return
-        # Wait before polling again (e.g., 5 seconds)
-        await sleep(5)
-
-    # Once the background task completes, process the results
-    if transactions:
-        unique_token_addresses = extract_unique_tokens(transactions)
-        # Use Flask server to process token data with multiple proxies
-        print(f"Fetching metadata for tokens: {unique_token_addresses}")
-        unique_token_addres = list(set(unique_token_addresses))  # Remove duplicates
-        print(f"Unique token addresses counts: {len(unique_token_addres)}")
-        await status_message.edit_text(f"Transaction processing complete. Processing results for {len(unique_token_addres)} tokens traded by {address}...")
-
-        results = await fetch_token_data_from_server(update, unique_token_addresses, active_proxies)
-
-        if "error" in results:
-            await update.message.reply_text(f"Error fetching metadata: {results['error']}")
-            return
-
-        # await fetch_the_metadata(unique_token_addresses, proxies)
-
-        # Save and process account transactions with metadata results
-        await save_account_transactions_to_file(update, address, transactions, analyses_period, proxy, results)
-    else:
-        await update.message.reply_text(f"No relevant transactions found for {address}.")
-        return
-
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"fetch_and_save_transactions took {elapsed_time:.2f} seconds to complete")
-
-async def fetch_the_metadata(unique_token_addresses, proxy=None):
-    """
-    Sends token list and proxies to Flask server for processing.
-    """
-    fetchMetadataurl = f"{SERVER_URL}/fetchMetadata"  # Replace with your actual server IP
-
-    payload = {
-        "unique_token_addresses": list(unique_token_addresses)
-    }
-
-    # Use aiohttp to make an async POST request
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(fetchMetadataurl, json=payload) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    print(f"Error from server: {response.status}, {await response.text()}")
-                    return {"error": f"Server returned status {response.status}"}
-        except Exception as e:
-            print(f"Error sending request at Fetch_the_metadata: {e}")
-            return {"error": "Request failed"}
-
-# for main file-top_traders
-# for main file-top_traders
-# for main file-top_traders
-
-# Main function to gather, process, and fetch metadata
-
-async def gather_process_fetch_with_multiple_proxies_top(r, update, mint_address, active_proxies, proxies):
-    start_time = time.time()
-    fetchTokenDefiTransurl = f"{SERVER_URL}/fetchTokenDEFITrans"
-    
-    # Send an immediate acknowledgment to the user
-    status_message = await update.message.reply_text(
-        f"Fetching transactions for {mint_address}. This may take several minutes..."
-    )
-    
-    # Call the Flask endpoint to enqueue the task
-    payload = {
-        "active_proxies": active_proxies,
-        "proxies": proxies,
-        "mint_address": mint_address
-    }
-    
-    async with aiohttp.ClientSession() as session:
-         async with session.post(fetchTokenDefiTransurl, json=payload) as resp:
-             if resp.status != 202:
-                 await status_message.edit_text("Failed to start transaction processing. Please try again later.")
-                 return
-             data = await resp.json()
-             task_id = data.get("task_id")
-    
-    # Poll the task status until the background task completes
-    transactions = None
-    while True:
-         async with aiohttp.ClientSession() as session:
-             async with session.get(f"{SERVER_URL}/task_status/{task_id}") as resp:
-                 data = await resp.json()
-                 if data.get("state") == "SUCCESS":
-                     transactions = data.get("result")
-                     break
-                 elif data.get("state") == "FAILURE":
-                     await status_message.edit_text("Transaction processing failed. Please try again later.")
-                     return
-         # Wait before polling again (e.g., 5 seconds)
-         await sleep(5)
-    
-    # Once the background task completes, process the results
-    if transactions:
-        with open(f"{mint_address}_address.json", "w") as f:
-            json.dump(transactions, f, indent=2)
-        #  unique_token_addresses = extract_unique_tokens(transactions)
-        await generate_top_trader_file(update, r, mint_address, transactions, proxies)
-        await update.message.reply_text(f"Top traders data for token {mint_address} has been successfully fetched.")
-    else:
-         await update.message.reply_text(f"No relevant transactions found for {mint_address}.")
-         return
-
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"fetch_and_save_transactions took {elapsed_time:.2f} seconds to complete")
-
-async def fetch_active_proxies(proxies):
-    """
-    Calls the Flask API to filter active proxies.
-    """
-    response = requests.post(f"{SERVER_URL}/checkProxies", json={"proxies": proxies})
-    
-    if response.status_code == 200:
-        return response.json().get("active_proxies", [])
-    else:
-        print(f"Error fetching active proxies: {response.text}")
+                print(f"Failed to fetch transactions. Status: {response.status}, Response: {await response.text()}")
+                return []
+    except Exception as e:
+        print(f"Error fetching transactions: {e}")
         return []
 
-async def fetch_and_save_for_multiple_addresses_wal(update, addresses, analyses_period, proxies):
-    """
-    Fetch active proxies from the server and distribute tasks across them.
-    """
-    active_proxies = await fetch_active_proxies(proxies)  # Get valid proxies from Flask
+# START OF THE TOKEN REPORTING FUNCTIONALITY
+def get_cache_filename(token):
+    """Build a cache filename for a given token within cache directory."""
+    # Use the first 2 characters of token to create subdirectories
+    # This reduces the number of files in a single directory
+    prefix = token[:2] if len(token) >= 2 else token
+    directory = os.path.join("cache_tokens", prefix)
+    ensure_directory_exists(directory)
+    return os.path.join(directory, f"cache_{token}.pkl")  # Using pickle format
 
-    if not active_proxies:
-        await update.message.reply_text("No active proxies available.")
-        return
+def get_cache_index_filename():
+    """Get the filename for the cache index."""
+    directory = "cache_tokens"
+    ensure_directory_exists(directory)
+    return os.path.join(directory, "cache_index.pkl")
 
-    random.shuffle(active_proxies)
-    proxy_cycle = cycle(active_proxies)  # Create a cycle of proxies
+@lru_cache(maxsize=1000)
+def cache_file_exists(token):
+    """Check if cache file exists with LRU caching for better performance."""
+    filename = get_cache_filename(token)
+    return os.path.exists(filename)
 
-    tasks = []
-    for address in addresses:
-        proxy = next(proxy_cycle)  # Get the next available proxy
-
-        if proxy not in proxy_usage:  # Ensure the proxy has a semaphore
-            proxy_usage[proxy] = Semaphore(1)
-
-        async with proxy_usage[proxy]:  # Use the semaphore to avoid overload
-            tasks.append(
-                fetch_account_transactions_from_server_wal(update, address, proxies, analyses_period, active_proxies, proxy)
-            )
-
-    await gather(*tasks)  # Execute all tasks concurrently
-
-# for main file-top_traders
-# for main file-top_traders
-# for main file-top_traders
-async def fetch_and_save_for_multiple_mint_addresses_top(r, update, mint_addresses, proxies):
-    """
-    Fetch active proxies from the server and distribute tasks across them.
-    """
-
-    # Ensure mint_addresses is a list
-    if isinstance(mint_addresses, str):
-        mint_addresses = [mint_addresses]  # Wrap single address in a list
-
-    # Get active proxies from Flask server
-    active_proxies = await fetch_active_proxies(proxies)
-
-    if not active_proxies:
-        await update.message.reply_text("No active proxies available.")
-        return
-
-    random.shuffle(active_proxies)
-    proxy_cycle = cycle(active_proxies)  # Create a cycle of active proxies
-
-    tasks = []
-    for mint_address in mint_addresses:  # Iterate over the list of addresses
-        # Get the next available proxy that isn't overused
-        proxy = await get_next_available_proxy(proxy_cycle)
-
-        # Ensure proxy has a semaphore before using it
-        if proxy not in proxy_usage:
-            proxy_usage[proxy] = Semaphore(1)
-
-        # Limit usage of the proxy using semaphore
-        print("here")
-        async with proxy_usage[proxy]:
-            tasks.append(
-                gather_process_fetch_with_multiple_proxies_top(
-                    r, update, mint_address, active_proxies, proxy
-                )
-            )
-
-    # Gather all tasks and await their completion
-    await gather(*tasks)
-
-async def getDaysLeft(user_id):
-    """Fetch the remaining subscription days for a user."""
+def update_cache_index(token, expiry_time):
+    """Update the cache index with a token and its expiry time."""
+    index_file = get_cache_index_filename()
     try:
-        url = f"https://bagscan-bot.vercel.app/api/days_left/{user_id}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logging.info(f"Days left for user {user_id}: {data}")
-                    return data  # Return the entire response JSON
-                else:
-                    logging.warning(f"Failed to fetch days left for user {user_id}: {response.status}")
-                    return {"message": "Failed to fetch days left", "data": {}}
+        if os.path.exists(index_file):
+            with open(index_file, "rb") as f:
+                cache_index = pickle.load(f)
+        else:
+            cache_index = {}
+        
+        cache_index[token] = expiry_time
+        
+        # Clean up expired entries
+        current_time = time.time()
+        cache_index = {k: v for k, v in cache_index.items() if v > current_time}
+        
+        with open(index_file, "wb") as f:
+            pickle.dump(cache_index, f)
     except Exception as e:
-        logging.error(f"Error fetching days left for user {user_id}: {e}")
-        return {"message": "Error occurred", "data": {}}
+        logger.error(f"Error updating cache index: {e}")
 
-
-async def getUserPlan(user_id):
-    url = f"https://bagscan-bot.vercel.app/api/user/{user_id}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                logging.info(f"Fetching user data for ID {user_id}, status: {response.status}")
-                if response.status == 200:
-                    data = await response.json()
-                    logging.info(f"User data fetched successfully: {data}")
-                    return data
-                else:
-                    logging.warning(f"Failed to fetch user data. Status: {response.status}")
-                    return None
-    except Exception as e:
-        logging.error(f"Error in getUserPlan: {e}")
+def get_cached_token_data(token):
+    """
+    Get cached token data with optimized in-memory lookup first.
+    Returns the cached data if valid, or None otherwise.
+    """
+    # Check in-memory cache first (fastest)
+    if token in TOKEN_CACHE:
+        cache_entry = TOKEN_CACHE[token]
+        if time.time() < cache_entry["expiry"]:
+            logger.info(f"Using in-memory cached data for token {token}")
+            return cache_entry["data"]
+        else:
+            # Remove expired entry
+            del TOKEN_CACHE[token]
+    
+    # If not in memory, check file cache
+    if not cache_file_exists(token):
         return None
+        
+    filename = get_cache_filename(token)
+    mod_time = os.path.getmtime(filename)
+    
+    if time.time() - mod_time < CACHE_TIMEOUT:
+        try:
+            with open(filename, "rb") as f:
+                data = pickle.load(f)
+                # Update in-memory cache for future use
+                TOKEN_CACHE[token] = {
+                    "data": data,
+                    "expiry": mod_time + CACHE_TIMEOUT
+                }
+                logger.info(f"Using file cached data for token {token}")
+                return data
+        except Exception as e:
+            logger.error(f"Error reading cache file for token {token}: {e}")
+    
+    return None
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-
-    data = {
-        "firstName": user.first_name,
-        "lastName": user.last_name,
-        "username": user.username,
-        "id": user.id,
-        "is_bot": user.is_bot,
+def save_cached_token_data(token, data):
+    """
+    Saves the token data to both in-memory and file cache for faster access.
+    """
+    # Calculate expiry time
+    expiry_time = time.time() + CACHE_TIMEOUT
+    
+    # Update in-memory cache
+    TOKEN_CACHE[token] = {
+        "data": data,
+        "expiry": expiry_time
     }
+    
+    # Also save to file for persistence
+    filename = get_cache_filename(token)
+    try:
+        with open(filename, "wb") as f:
+            pickle.dump(data, f)
+        
+        # Update the cache index
+        update_cache_index(token, expiry_time)
+        logger.info(f"Cached data saved for token {token}")
+    except Exception as e:
+        logger.error(f"Error saving cache file for token {token}: {e}")
 
-    user_id = user.id
-    await createNewUser(data)
+async def check_cache_exists_batch(tokens):
+    """
+    Check if cache files exist for multiple tokens simultaneously.
+    Returns a dictionary of {token: cached_data} for tokens with valid cache.
+    """
+    # First check in-memory cache
+    results = {}
+    tokens_to_check = []
+    
+    for token in tokens:
+        if token in TOKEN_CACHE and time.time() < TOKEN_CACHE[token]["expiry"]:
+            results[token] = TOKEN_CACHE[token]["data"]
+        else:
+            tokens_to_check.append(token)
+    
+    # For remaining tokens, check file system in parallel
+    if tokens_to_check:
+        tasks = [create_task(check_file_cache(token)) for token in tokens_to_check]
+        cache_results = await gather(*tasks)
+        
+        for token, data in zip(tokens_to_check, cache_results):
+            if data:
+                results[token] = data
+    
+    return results
 
-    # Fetch user data and plan
-    user_data = await getUserPlan(user_id)
-    plan = "Free"  # Default plan
-    status = "Inactive"  # Default status
-    if user_data and user_data.get("data"):
-        subscription = user_data["data"].get("subscription", {})
-        plan_details = subscription.get("plan", {})
-        plan = plan_details.get("plan", "Free").capitalize()
-        status = subscription.get("status", "Inactive").capitalize()
+async def check_file_cache(token):
+    """Check file cache for a single token asynchronously"""
+    if not cache_file_exists(token):
+        return None
+        
+    filename = get_cache_filename(token)
+    mod_time = os.path.getmtime(filename)
+    
+    if time.time() - mod_time < CACHE_TIMEOUT:
+        try:
+            with open(filename, "rb") as f:
+                data = pickle.load(f)
+                # Update in-memory cache
+                TOKEN_CACHE[token] = {
+                    "data": data,
+                    "expiry": mod_time + CACHE_TIMEOUT
+                }
+                return data
+        except Exception as e:
+            logger.error(f"Error reading cache file for token {token}: {e}")
+    
+    return None
 
-    # Get user details
-    username = user.first_name or user.username or "there"
 
-    # Fetch subscription status and days left
-    days_left_response = await getDaysLeft(user.id)
-    days_left_message = days_left_response.get("message", "N/A")
-    days_left = days_left_response.get("data", {}).get("daysLeft", "N/A")
-    formatted_date = days_left_response.get("data", {}).get("formattedDate", "N/A")
+async def fetch_token_data(token_m, proxy, semaphore, results, failed_tokens, retry_attempt=0):
+    """
+    Fetch token data from the RugCheck report API with improved error handling
+    and proxy management. On a successful fetch, the cache is updated.
+    """
+    global proxy_stats, proxy_cooldowns
 
-    # Fetch subscription status
-    subscription_status = await checkSubscription(user.id)
+    # Check if proxy is on cooldown
+    current_time = time.time()
+    if proxy in proxy_cooldowns and proxy_cooldowns[proxy] > current_time:
+        logger.info(f"Proxy {proxy} is on cooldown, skipping")
+        failed_tokens.append((token_m, retry_attempt))
+        return
 
-    # Construct subscription information
-    if subscription_status.get("hasSubscription"):
-        subscription_info = (
-            f"🎉 *Subscription Active!*\n"
-            f"- Plan: *{plan}*\n"
-            f"- Status: *{status}*\n"
-            f"- Days left: *{days_left}*\n"
-            f"- Expires on: *{formatted_date}*\n\n"
+    url = f"https://api.rugcheck.xyz/v1/tokens/{token_m}/report"
+
+    async with semaphore:
+        try:
+            ip, port, username, password = proxy.split(':')
+            proxy_url = f"http://{username}:{password}@{ip}:{port}"
+            logger.info(f"Using proxy {proxy_url} for token {token_m} (attempt {retry_attempt+1})")
+
+            connector = TCPConnector(keepalive_timeout=60)
+            timeout = ClientTimeout(total=10.0, connect=5.0)
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Cache-Control": "no-cache"
+            }
+
+            async with ClientSession(timeout=timeout, connector=connector) as session:
+                start_time = time.time()
+                async with session.get(url, proxy=proxy_url, headers=headers, ssl=False) as response:
+                    response_time = time.time() - start_time
+
+                    if proxy not in proxy_stats:
+                        proxy_stats[proxy] = {"success": 0, "fail": 0, "avg_time": 0}
+
+                    if response.status == 200:
+                        proxy_stats[proxy]["success"] += 1
+                        proxy_stats[proxy]["avg_time"] = (proxy_stats[proxy]["avg_time"] * (proxy_stats[proxy]["success"] - 1) + response_time) / proxy_stats[proxy]["success"]
+
+                        data = await response.json()
+                        score_norm = data.get("score_normalised", "N/A")
+                        markets = data.get("markets", [])
+                        basePrice = "N/A"
+                        quotePrice = "N/A"
+                        if markets and isinstance(markets, list) and len(markets) > 0:
+                            lp = markets[0].get("lp", {})
+                            basePrice = lp.get("basePrice", "N/A")
+                            quotePrice = lp.get("quotePrice", "N/A")
+
+                        token_info = data.get("token", {})
+                        if token_info and isinstance(token_info, dict):
+                            decimals = token_info.get("decimals", "N/A")
+                            supply = token_info.get("supply", "N/A")
+                        else:
+                            decimals = "N/A"
+                            supply = "N/A"
+
+                        token_result = {
+                            "score_normalised": score_norm,
+                            "basePrice": basePrice,
+                            "quotePrice": quotePrice,
+                            "supply": supply,
+                            "decimals": decimals,
+                            "proxy_used": proxy_url,
+                            "response_time": round(response_time, 2)
+                        }
+                        results[token_m] = token_result
+
+                        # Save fetched data to cache
+                        save_cached_token_data(token_m, token_result)
+                        logger.info(f"Successfully fetched data for {token_m} in {round(response_time, 2)}s")
+                    elif response.status == 429:
+                        logger.warning(f"Rate limit hit for token {token_m} with proxy {proxy}. Adding to retry queue.")
+                        proxy_stats[proxy]["fail"] += 1
+                        proxy_cooldowns[proxy] = current_time + COOLDOWN_PERIOD
+                        failed_tokens.append((token_m, retry_attempt))
+                    else:
+                        logger.error(f"Error fetching data for token {token_m}: Status {response.status}")
+                        proxy_stats[proxy]["fail"] += 1
+                        failed_tokens.append((token_m, retry_attempt))
+        except Exception as e:
+            if proxy in proxy_stats:
+                proxy_stats[proxy]["fail"] += 1
+            else:
+                proxy_stats[proxy] = {"success": 0, "fail": 1, "avg_time": 0}
+
+            logger.error(f"Error fetching data for token {token_m} with proxy {proxy}: {str(e)}")
+            failed_tokens.append((token_m, retry_attempt))
+            if retry_attempt >= MAX_RETRIES:
+                results[token_m] = {
+                    "score_normalised": "N/A",
+                    "basePrice": "N/A",
+                    "quotePrice": "N/A",
+                    "supply": "N/A",
+                    "decimals": "N/A",
+                    "proxy_used": proxy,
+                    "error": str(e)
+                }
+
+async def check_tokens_for_report(token_mint, active_proxies):
+    """
+    Process tokens with smarter retry logic and proxy selection.
+    Uses optimized cache checking for faster performance.
+    """
+    results = {}
+    failed_tokens = []
+    semaphore = Semaphore(5)  # Limit concurrent requests
+    tasks = []
+    
+    # Check all tokens against cache in one batch operation
+    cached_results = await check_cache_exists_batch(token_mint)
+    results.update(cached_results)
+    
+    # Only process tokens that weren't found in cache
+    tokens_to_fetch = [token for token in token_mint if token not in cached_results]
+    
+    if not tokens_to_fetch:
+        logger.info("All tokens found in cache, no API requests needed")
+        return results
+        
+    logger.info(f"Found {len(cached_results)} tokens in cache, fetching {len(tokens_to_fetch)} from API")
+    
+    for token in tokens_to_fetch:
+        proxy = select_best_proxy(active_proxies)
+        tasks.append(fetch_token_data(token, proxy, semaphore, results, failed_tokens, 0))
+    
+    if tasks:
+        await gather(*tasks)
+
+    # Process any tokens that failed to fetch (with retries)
+    retry_attempt = 0
+    while failed_tokens and retry_attempt < MAX_RETRIES:
+        retry_attempt += 1
+        logger.info(f"Starting retry attempt {retry_attempt} for {len(failed_tokens)} tokens")
+        await sleep(2 ** retry_attempt)
+
+        retry_batch = failed_tokens.copy()
+        failed_tokens = []
+        new_tasks = []
+
+        for token, prev_attempts in retry_batch:
+            # Check cache again before retrying
+            cached_data = get_cached_token_data(token)
+            if cached_data:
+                results[token] = cached_data
+                continue
+            proxy = select_different_proxy(active_proxies, results.get(token, {}).get("proxy_used", ""))
+            new_tasks.append(fetch_token_data(token, proxy, semaphore, results, failed_tokens, prev_attempts + 1))
+
+        if new_tasks:
+            await gather(*new_tasks)
+
+    for token, _ in failed_tokens:
+        if token not in results:
+            results[token] = {
+                "score_normalised": "N/A",
+                "basePrice": "N/A",
+                "quotePrice": "N/A",
+                "supply": "N/A",
+                "decimals": "N/A",
+                "proxy_used": "max_retries_reached",
+                "error": "Maximum retries reached"
+            }
+
+    logger.info(f"Proxy performance stats: {json.dumps(proxy_stats, indent=2)}")
+    return results
+
+def select_best_proxy(proxies):
+    """
+    Select the best performing proxy based on success rate and response time.
+    """
+    if not proxy_stats:
+        return random.choice(proxies)
+    current_time = time.time()
+    available_proxies = [p for p in proxies if p not in proxy_cooldowns or proxy_cooldowns[p] <= current_time]
+    if not available_proxies:
+        return min(proxies, key=lambda p: proxy_cooldowns.get(p, current_time))
+    ranked_proxies = []
+    for proxy in available_proxies:
+        if proxy in proxy_stats:
+            stats = proxy_stats[proxy]
+            total = stats["success"] + stats["fail"]
+            success_rate = stats["success"] / total if total > 0 else 0
+            score = success_rate * (1 / (stats["avg_time"] + 0.1))
+            ranked_proxies.append((proxy, score))
+        else:
+            ranked_proxies.append((proxy, 0.5))
+    if ranked_proxies:
+        total_score = sum(score for _, score in ranked_proxies)
+        if total_score > 0:
+            r = random.random() * total_score
+            cumulative = 0
+            for proxy, score in ranked_proxies:
+                cumulative += score
+                if cumulative >= r:
+                    return proxy
+    return random.choice(available_proxies)
+
+def select_different_proxy(proxies, previous_proxy):
+    """
+    Select a different proxy than the one previously used.
+    """
+    if len(proxies) == 1:
+        return proxies[0]
+    available = [p for p in proxies if p != previous_proxy]
+    if not available:
+        return random.choice(proxies)
+    return select_best_proxy(available)
+
+def run_async_batch_report(batch, active_proxies):
+    loop = new_event_loop()
+    set_event_loop(loop)
+    return loop.run_until_complete(check_tokens_for_report(batch, active_proxies))
+
+async def process_tokens_in_batches(token_mint, active_proxies, batch_size=10):
+    """
+    Process tokens in optimized batches with faster cache checking.
+    Increased batch size from 3 to 10 for better performance.
+    """
+    # First check all tokens against cache in one operation
+    cached_results = await check_cache_exists_batch(token_mint)
+    
+    # Only process tokens that weren't found in cache
+    tokens_to_fetch = [token for token in token_mint if token not in cached_results]
+    
+    logger.info(f"Found {len(cached_results)} tokens in cache out of {len(token_mint)} total tokens")
+    
+    if not tokens_to_fetch:
+        logger.info("All tokens found in cache, no API requests needed")
+        return cached_results
+        
+    # Process remaining tokens in batches
+    def divide_into_batches(tokens, batch_size):
+        for i in range(0, len(tokens), batch_size):
+            yield tokens[i:i+batch_size]
+    
+    token_batches = list(divide_into_batches(tokens_to_fetch, batch_size))
+    batch_results = {}
+    
+    for batch in token_batches:
+        results = await check_tokens_for_report(batch, active_proxies)
+        batch_results.update(results)
+        await sleep(0.5)  # shorter pause between batches
+    
+    # Combine cached and fresh results
+    combined_results = {**cached_results, **batch_results}
+    return combined_results
+
+# END OF TOKEN REPORTS
+
+def is_within_n_days(time_str, analyses_period=7):
+    """
+    Determine if a UTC time string represents a time within the last analyses_period days.
+    
+    Args:
+        time_str (str): UTC datetime string in format "MM-DD-YYYY HH:MM:SS"
+        analyses_period (int): Maximum threshold in days.
+        
+    Returns:
+        bool: True if the transaction is within the last analyses_period days, otherwise False.
+    """
+    try:
+        # Parse the UTC datetime string
+        transaction_time = datetime.strptime(time_str, '%m-%d-%Y %H:%M:%S')
+        current_time = datetime.utcnow()  # Current time in UTC
+        time_diff = current_time - transaction_time
+        return time_diff.days <= analyses_period
+    except ValueError as e:
+        logger.error(f"Error parsing datetime: {e}")
+        return True  # Default to considering it recent if parsing fails
+
+def convert_utc_to_formats(utc_time_str):
+    """
+    Convert a UTC time string to multiple formats: relative time and unix timestamp.
+    
+    Args:
+        utc_time_str (str): UTC datetime string in format "MM-DD-YYYY HH:MM:SS"
+        
+    Returns:
+        dict: Dictionary containing original UTC string, relative time, and unix timestamp
+    """
+    try:
+        # Parse the UTC datetime string
+        transaction_time = datetime.strptime(utc_time_str, '%m-%d-%Y %H:%M:%S')
+        current_time = datetime.utcnow()  # Current time in UTC
+        
+        # Calculate time difference
+        time_diff = current_time - transaction_time
+        
+        # Convert to Unix timestamp (seconds since epoch)
+        unix_timestamp = int(transaction_time.timestamp())
+        
+        # Generate relative time string
+        if time_diff.days > 365:
+            years = time_diff.days // 365
+            relative_time = f"{years} {'year' if years == 1 else 'years'} ago"
+        elif time_diff.days > 30:
+            months = time_diff.days // 30
+            relative_time = f"{months} {'month' if months == 1 else 'months'} ago"
+        elif time_diff.days > 0:
+            relative_time = f"{time_diff.days} {'day' if time_diff.days == 1 else 'days'} ago"
+        elif time_diff.seconds // 3600 > 0:
+            hours = time_diff.seconds // 3600
+            relative_time = f"{hours} {'hour' if hours == 1 else 'hours'} ago"
+        elif time_diff.seconds // 60 > 0:
+            minutes = time_diff.seconds // 60
+            relative_time = f"{minutes} {'minute' if minutes == 1 else 'minutes'} ago"
+        else:
+            relative_time = f"{time_diff.seconds} {'second' if time_diff.seconds == 1 else 'seconds'} ago"
+        
+        return {
+            "utc_time": utc_time_str,
+            "relative_time": relative_time,
+            "unix_timestamp": unix_timestamp
+        }
+    except ValueError as e:
+        logger.error(f"Error converting datetime: {e}")
+        return {
+            "utc_time": utc_time_str,
+            "relative_time": "unknown",
+            "unix_timestamp": None
+        }
+
+async def check_and_solve_cloudflare(page, context) -> bool:
+    """Navigate (or reload) the page, solve Turnstile if present, and ensure bypass."""
+    logger.info("Injecting Turnstile hook & loading page...")
+    await context.add_init_script(HOOK_SCRIPT)
+
+    # Load or reload the page
+    try:
+        await page.reload(wait_until="domcontentloaded")
+    except:
+        await page.goto(page.url, wait_until="domcontentloaded")
+
+    # Give the hook a moment
+    await sleep(1)
+
+    # If no widget params found, assume no Turnstile
+    params = await page.evaluate("window._cfTurnstileParams || null")
+    if not params:
+        logger.info("No Turnstile detected.")
+        return True
+
+    logger.info(f"Captured Turnstile params: {json.dumps(params, indent=2)}")
+
+    # Solve via 2Captcha
+    try:
+        result = solver.turnstile(
+            type=params["type"],
+            sitekey=params["sitekey"],
+            url=params["url"],
+            data=params["data"],
+            pagedata=params["pagedata"],
+            action=params["action"],
+            useragent=params["userAgent"]
         )
-    else:
-        subscription_info = (
-            f"🚀 *No active subscription.*\n"
-            "👉 Tap '🔒 Subscribe' below to unlock premium features.\n\n"
-        )
+        token = result["code"]
+        logger.info("2Captcha returned token.")
+    except Exception as e:
+        logger.error(f"2Captcha solve failed: {e}")
+        await take_error_screenshot(page, "captcha_solve_failed")
+        return False
 
-    # Greeting message with subscription status
-    greeting_message = (
-        f"🤖 Hey {username}, welcome to *BagScan* - your ultimate wallet and token analytics bot! 🚀\n\n"
-        f"{subscription_info}"
-        "🌟 *What you can do here:*\n"
-        "✅ *Analyze Wallets*: Track trading stats and trends effortlessly.\n"
-        "✅ *Discover Top Holders*: Fetch detailed token holder data with ease.\n"
-        "✅ *Explore Top Traders*: Identify influential traders and their activity.\n"
-        "✅ *Real-Time Insights*: Stay ahead with live wallet and token analysis.\n\n"
-        "👇 Select an option below to get started:"
+    # Inject token
+    injected = await page.evaluate(
+        """(t) => {
+             if (window._cfTurnstileCallback) {
+               window._cfTurnstileCallback(t);
+               return true;
+             }
+             return false;
+           }""",
+        token
     )
+    if injected is not True:
+        logger.error("Token injection failed.")
+        await take_error_screenshot(page, "token_injection_failed")
+        return False
 
-    # Define the welcome keyboard with the Subscribe button
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Analyze Wallets", callback_data="analyze_wallets"),
-            InlineKeyboardButton("💰 Fetch Top Holders", callback_data="fetch_holders"),
-        ],
-        [
-            InlineKeyboardButton("📈 Fetch Top Traders", callback_data="fetch_top_holders"),
-            InlineKeyboardButton("💡 Help & Instructions", callback_data="help_instructions"),
-        ],
-        [
-            InlineKeyboardButton("🔗 Referrals", callback_data="referrals"),
-            InlineKeyboardButton("🛠 Backup Bots", callback_data="backup_bots"),
-        ],
-        [
-            InlineKeyboardButton("🔒 Subscribe", callback_data="subscribe"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="open_settings"),
-        ],
-        [
-            InlineKeyboardButton("❌ Dismiss", callback_data="dismiss_message"),
-        ],
-    ]
+    logger.info("Token injected; reloading to finalize bypass.")
+    try:
+        await page.wait_for_timeout(1000)
+        await page.reload(wait_until="networkidle")
+    except Exception:
+        await page.goto(page.url, wait_until="networkidle")
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Verify bypass
+    content = await page.content()
+    if "cf-browser-verification" in content.lower() or "turnstile" in content.lower():
+        logger.error("Still blocked after injection.")
+        await take_error_screenshot(page, "post_injection_blocked")
+        return False
 
-    # Send the welcome message
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=greeting_message,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-    )
+    logger.info("Successfully bypassed Cloudflare Turnstile!")
+    return True
 
+# -------------------------------------------------------------------
+# Scraping functions
+# -------------------------------------------------------------------
+async def get_all_signatures_01(mint_address, active_proxies=None, proxy=None):
+    URL = "https://solscan.io"
+    pages_counter = 0
+    total_processing_time = 0
 
+    metadata = await fetch_and_store_metadata([mint_address], proxy)
+    symbol = metadata.get(mint_address, {}).get("content", {}).get("metadata", {}).get("symbol", "N/A")
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+    all_data = await load_existing_data(mint_address)
+    existing_signatures = {item["signature"] for item in all_data if item.get("signature") and item["signature"] != "N/A"}
 
-async def subscription_modal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = query.message.chat.id
+    new_data = []
+    found_existing = False
 
-    admin_usernames = ["admin1", "admin2"]  # Replace with actual admin usernames
-    admin_contacts = ", ".join([f"@{username}" for username in admin_usernames])
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=True)
+        context = await browser.new_context(ignore_https_errors=True, user_agent=USER_AGENT)
+        page = await context.new_page()
+        target_url = f"{URL}/token/{mint_address}?activity_type=ACTIVITY_TOKEN_SWAP&activity_type=ACTIVITY_AGG_TOKEN_SWAP#defiactivities"
+        await page.goto(target_url, timeout=90000)
 
-    subscription_message = (
-        "✨ *Subscription Plans:*\n\n"
-        "🎁 *Free Tier:*\n- Limited features\n\n"
-        "💎 *Monthly Plan:*\n- $10/month\n- Full access\n\n"
-        "👑 *Yearly Plan:*\n- $100/year (Save 20%)\n- Full access\n\n"
-        f"📩 Contact admins for a coupon code: {admin_contacts}\n\n"
-        "👉 Enter your coupon code below to activate your subscription."
-    )
+        if not await check_and_solve_cloudflare(page, context):
+            logger.error("Failed to bypass Cloudflare. Aborting.")
+            return all_data
 
-    # Define navigation keyboard
-    keyboard = [
-        [
-            InlineKeyboardButton("🔙 Menu", callback_data="open_main_menu"),
-            InlineKeyboardButton("❌ Dismiss", callback_data="dismiss_message")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+        await page.wait_for_selector(".caption-bottom", timeout=60000)
+        total_elem = await page.get_by_text("activities(s)").first.text_content()
+        total = int(re.search(r"Total\s([\d,]+)", total_elem).group(1).replace(",", ""))
+        rows_per_page = 100
+        total_pages = (total + rows_per_page - 1) // rows_per_page
+        logger.info(f"Total activities: {total} | Pages: {total_pages}")
 
-    # Send the subscription message with the navigation keyboard
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=subscription_message,
-        parse_mode="Markdown",
-        reply_markup=reply_markup,  # Now properly defined
-    )
+        # Set 100 rows/page
+        await page.locator("button[role='combobox']").click()
+        await page.get_by_label("100", exact=True).get_by_text("100").click()
+        await page.wait_for_timeout(3000)
 
-    # Ask the user to enter their coupon code
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🔑 Please enter your coupon code (e.g., ABC123):",
-        reply_markup=ForceReply(),  # Force the user to reply
-    )
+        while pages_counter < total_pages:
+            start = time.time()
+            rows = await page.evaluate("""
+                () => Array.from(document.querySelectorAll(".caption-bottom tr"))
+                      .map(r => Array.from(r.querySelectorAll("td")).map(td => td.innerText.trim()))
+            """)
+            processed = []
+            for row in rows:
+                if len(row) < 7: continue
+                sig = row[1].strip()
+                if sig in existing_signatures: continue
+                data = {
+                    "mint_addr": mint_address,
+                    "mint_symbol": symbol,
+                    "signature": sig,
+                    "trade_time": row[2].strip(),
+                    "transaction_by": row[4].strip(),
+                    **dict(zip(
+                        ["token_sold_amount","token_sold","token_bought_amount","token_bought"],
+                        row[5].splitlines()[:4]
+                    )),
+                    "txn_usd_value": row[6].strip()
+                }
+                processed.append(data)
+                existing_signatures.add(sig)
 
+            if processed:
+                new_data.extend(processed)
+                await save_accumulated_data(mint_address, new_data + all_data)
+            else:
+                found_existing = True
+                break
 
-# function to process the coupon code
+            elapsed = time.time() - start
+            logger.info(f"Page {pages_counter+1} done in {elapsed:.2f}s")
 
-async def process_coupon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    chat_id = update.message.chat_id
-    coupon_code = update.message.text.strip()  # Get the coupon code
+            if pages_counter < total_pages - 1:
+                await page.locator("div:nth-child(2) > button:nth-child(4)").click()
+                pages_counter += 1
+                await page.wait_for_timeout(5000)
+                if pages_counter % 5 == 0:
+                    await check_and_solve_cloudflare(page, context)
+            else:
+                break
+
+        await save_accumulated_data(mint_address, new_data + all_data)
+        return new_data + all_data
+
+async def get_all_account_signatures_01(address, update, proxy=None, analyses_period=7, active_proxies=None):
+    URL = "https://solscan.io"
+    pages_counter = 0
+    total_processing_time = 0
+    new_data = []
+    found_old = False
+
+    cutoff = datetime.utcnow() - timedelta(days=analyses_period)
+
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=True)
+        context = await browser.new_context(ignore_https_errors=True, user_agent=USER_AGENT)
+        page = await context.new_page()
+        target = f"{URL}/account/{address}?activity_type=ACTIVITY_TOKEN_SWAP&activity_type=ACTIVITY_AGG_TOKEN_SWAP#defiactivities"
+        await page.goto(target)
+
+        if not await check_and_solve_cloudflare(page, context):
+            logger.error("Failed Cloudflare bypass. Aborting.")
+            return []
+
+        await page.wait_for_selector(".caption-bottom", timeout=60000)
+        total_elem = await page.get_by_text("activities(s)").first.text_content()
+        total = int(re.search(r"Total\s([\d,]+)", total_elem).group(1).replace(",", ""))
+        total_pages = (total + 99) // 100
+        logger.info(f"Total activities: {total} | Pages: {total_pages}")
+
+        # Set rows per page
+        await page.locator("button[role='combobox']").click()
+        await page.get_by_label("100", exact=True).get_by_text("100").click()
+        await page.wait_for_timeout(10000)
+
+        # Sort by time (desc)
+        await page.locator("th:has-text('Time') .flex-row").first.click()
+        await page.wait_for_timeout(2000)
+
+        while pages_counter < total_pages:
+            start = time.time()
+            rows = await page.evaluate("""
+                () => Array.from(document.querySelectorAll(".caption-bottom tr"))
+                      .map(r => Array.from(r.querySelectorAll("td")).map(td => {
+                        return {
+                          text: td.innerText.trim(),
+                          hrefs: Array.from(td.querySelectorAll("a")).map(a=>a.href)
+                        };
+                      }))
+            """)
+            for row in rows:
+                if len(row) < 7: continue
+
+                # parse time and skip old
+                rel = row[2]["text"]
+                if not is_within_n_days(rel, analyses_period):
+                    found_old = True
+                    break
+
+                times = convert_utc_to_formats(row[2]["text"])
+                details = row[5]["text"].splitlines()
+                sold_amt, sold, bought_amt, bought = details[:4]
+                sold_addr = row[5]["hrefs"][0].split("/")[-1] if row[5]["hrefs"] else None
+                bought_addr = row[5]["hrefs"][1].split("/")[-1] if len(row[5]["hrefs"])>1 else None
+
+                record = {
+                    "signature": row[1]["text"],
+                    "trade_time_utc": times["utc_time"],
+                    "trade_time_relative": times["relative_time"],
+                    "trade_time_unix": times["unix_timestamp"],
+                    "token_sold": sold,
+                    "token_sold_amount": sold_amt,
+                    "token_sold_address": sold_addr,
+                    "token_bought": bought,
+                    "token_bought_amount": bought_amt,
+                    "token_bought_address": bought_addr,
+                    "txn_usd_value": row[6]["text"]
+                }
+                new_data.append(record)
+
+            elapsed = time.time() - start
+            logger.info(f"Page {pages_counter+1} done in {elapsed:.2f}s")
+
+            if found_old:
+                logger.info("Encountered old transactions; stopping early.")
+                break
+
+            if pages_counter < total_pages - 1:
+                await page.locator("div:nth-child(2) > button:nth-child(4)").click()
+                pages_counter += 1
+                await page.wait_for_timeout(5000)
+                if pages_counter % 5 == 0:
+                    await check_and_solve_cloudflare(page, context)
+            else:
+                break
+
+        await save_accumulated_data(address, new_data)
+        return new_data
+
+async def get_all_account_signatures(address, update, proxy=None, analyses_period=7, active_proxies=None):
+    URL = "http://solscan.io"
+    pages_counter = 0
+    total_processing_time = 0
+    
+    # New data container (duplicates are not filtered)
+    new_data = []
+    found_old_txn = False  # Flag for transactions older than the threshold days
 
     try:
-        # Notify backend about the subscription activation
-        url = "https://bagscan-bot.vercel.app/api/subscribe"
-        payload = {"userId": user.id, "coupon": coupon_code}
+        async with async_playwright() as p:
+            browser_options = {
+                "headless": True,
+                "slow_mo": 0,
+            }
+            browser = await p.firefox.launch(**{k: v for k, v in browser_options.items() if v is not None})
+            context = await browser.new_context(ignore_https_errors=True)
+            page = await context.new_page() 
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as response:
-                # Log response details
-                logging.info(f"Response status: {response.status}")
-                response_text = await response.text()
-                logging.info(f"Response text: {response_text}")
+            target = f"{URL}/account/{address}?activity_type=ACTIVITY_TOKEN_SWAP&activity_type=ACTIVITY_AGG_TOKEN_SWAP#defiactivities"
+            await page.goto(target, timeout=90000)
+            
+            if not await check_and_solve_cloudflare(page, context):
+                logger.error("Failed to bypass Cloudflare. Aborting.")
+                return []
 
-                if response.status in [200, 201]:  # Check for both 200 and 201 status codes
-                    data = await response.json()
-                    if data.get("success"):
-                        # Notify user of successful subscription
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                "✅ *Subscription Activated!*\n"
-                                "🎉 You now have full access to BagScan's premium features.\n\n"
-                                "Thank you for subscribing! 🚀"
-                            ),
-                            parse_mode="Markdown",
-                        )
-                    else:
-                        # Handle backend response errors
-                        error_message = data.get("message", "Unknown error occurred.")
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=( 
-                                f"❌ *Failed to activate subscription:*\n"
-                                f"{error_message}\n\n"
-                                "Please contact an admin for assistance."
-                            ),
-                            parse_mode="Markdown",
-                        )
-                else:
-                    # Handle non-200/201 response
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"❌ *Error activating subscription:*\n"
-                            f"Server responded with status code {response.status}.\n"
-                            "Please try again later or contact support."
-                        ),
-                    )
+            logger.info(f"Accessed URL: {target}")
+
+            # Wait for activities to load
+            await page.wait_for_selector(".caption-bottom", timeout=60000)
+
+            # Get total activities count
+            activity_element = await page.get_by_text('activities(s)').first.text_content()
+            match = re.search(r"Total\s([\d,]+)", activity_element)
+            if not match:
+                logger.warning("Total activities not found.")
+                return
+            
+            total_activities = int(match.group(1).replace(",", ""))
+            rows_per_page = 100
+            total_pages = (total_activities + rows_per_page - 1) // rows_per_page
+            logger.info(f"Total activities: {total_activities} | Pages: {total_pages}")
+            
+            # Determine if we should apply early stopping due to date filtering
+            apply_early_stopping = total_pages > 10
+            logger.info(f"Apply early stopping: {apply_early_stopping} (total pages: {total_pages}) | (Duration: {analyses_period})")
+
+            cutoff_date = datetime.now() - timedelta(days=analyses_period)
+            logger.info(f"Cutoff date: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # Set rows per page to 100
+            pagination_button = page.locator("button[role='combobox']")
+            await pagination_button.click()
+            await page.get_by_label("100", exact=True).get_by_text("100").click()
+
+            await page.wait_for_timeout(10000)
+
+            time_column = page.locator("th:has-text('Time') .flex-row").first
+            await time_column.click()
+            await page.wait_for_timeout(2000)
+
+            # Updated evaluation: return an object for each cell with both text and hrefs.
+            while pages_counter < total_pages:
+                page_start_time = time.time()
+                logger.info(f"Processing page {pages_counter + 1} of {total_pages}")
+                
+                rows_data = await page.evaluate('''() => {
+                    const rows = Array.from(document.querySelectorAll(".caption-bottom tr:not(:empty)"));
+                    return rows.map(row => {
+                        const cells = Array.from(row.querySelectorAll("td"));
+                        return cells.map(cell => {
+                            const cellText = cell.innerText.trim();
+                            // Get all anchor hrefs (if any) in the cell.
+                            const anchors = Array.from(cell.querySelectorAll("a"));
+                            const hrefs = anchors.map(a => a.getAttribute("href"));
+                            return { text: cellText, hrefs: hrefs };
+                        });
+                    });
+                }''')
+                logger.info(f"Row_data: {rows_data}")
+                logger.info(f"Found {len(rows_data)} rows on page {pages_counter + 1}")
+                processed_data = []
+
+                for row in rows_data:
+                    # Skip rows with fewer cells than expected.
+                    if not row or len(row) < 7:
+                        continue
+
+                    # Extract basic fields using the cell object's text property.
+                    signature = row[1]["text"]
+                    trade_time_utc = row[2]["text"]
+                    transaction_by = row[4]["text"]
+                    
+                    # Check if transaction is within the analyses_period threshold.
+                    try:
+                        if not is_within_n_days(trade_time_utc, analyses_period=analyses_period):
+                            logger.info(f"Skipping transaction older than {analyses_period} days: {trade_time_utc}")
+                            found_old_txn = True
+                            continue
+                    except Exception as e:
+                        logger.warning(f"Error parsing relative time '{trade_time_utc}': {e}")
+                        continue
+                        
+                    # Convert the UTC time to relative time and Unix timestamp.
+                    time_formats = convert_utc_to_formats(trade_time_utc)
+                   
+                    # The token details cell (assumed at index 5) contains newline-separated data.
+                    details_cell = row[5]
+                    details_lines = details_cell["text"].split("\n")
+                    if len(details_lines) < 4:
+                        continue
+                    token_sold_amount = details_lines[0].strip()
+                    token_sold = details_lines[1].strip()
+                    token_bought_amount = details_lines[2].strip()
+                    token_bought = details_lines[3].strip()
+
+                    token_sold_address = None
+                    token_bought_address = None
+                    
+                    # Process the hrefs based on token names
+                    if len(details_cell["hrefs"]) == 1:
+                        # Only one href - need to determine if it belongs to token_sold or token_bought
+                        if token_sold == 'SOL' or token_sold == 'WSOL':
+                            # SOL is the sold token, so the href must be for the bought token
+                            token_sold_address = 'So11111111111111111111111111111111111111112'
+                            token_bought_address_str = details_cell["hrefs"][0]
+                            token_bought_address = token_bought_address_str.replace('/token/', '') if token_bought_address_str else None
+                        elif token_bought == 'SOL' or token_bought == 'WSOL':
+                            # SOL is the bought token, so the href must be for the sold token
+                            token_sold_address_str = details_cell["hrefs"][0]
+                            token_sold_address = token_sold_address_str.replace('/token/', '') if token_sold_address_str else None
+                            token_bought_address = 'So11111111111111111111111111111111111111112'
+                        else:
+                            # Neither is SOL, assume the href is for the token_sold
+                            token_sold_address_str = details_cell["hrefs"][0]
+                            token_sold_address = token_sold_address_str.replace('/token/', '') if token_sold_address_str else None
+                    elif len(details_cell["hrefs"]) >= 2:
+                        # Two or more hrefs - follow the original pattern
+                        token_sold_address_str = details_cell["hrefs"][0]
+                        token_bought_address_str = details_cell["hrefs"][1]
+                        token_sold_address = token_sold_address_str.replace('/token/', '') if token_sold_address_str else None
+                        token_bought_address = token_bought_address_str.replace('/token/', '') if token_bought_address_str else None
+
+                    # Ensure SOL addresses are set correctly
+                    if token_bought == 'SOL' and token_bought_address is None:
+                        token_bought_address = 'So11111111111111111111111111111111111111112'
+                    
+                    if token_sold == 'SOL' and token_sold_address is None:
+                        token_sold_address = 'So11111111111111111111111111111111111111112'
+                        
+                    # Also handle WSOL address correctly
+                    if token_bought == 'WSOL' and token_bought_address is None:
+                        token_bought_address = 'So11111111111111111111111111111111111111112'
+                    
+                    if token_sold == 'WSOL' and token_sold_address is None:
+                        token_sold_address = 'So11111111111111111111111111111111111111112'
+
+                    txn_usd_value = row[6]["text"]
+                    record = {
+                        # "account": address,
+                        "signature": signature,
+                        "trade_time_utc": time_formats["utc_time"],
+                        "trade_time_relative": time_formats["relative_time"],
+                        "trade_time_unix": time_formats["unix_timestamp"],
+                        # "transaction_by": transaction_by,
+                        "token_sold": token_sold,
+                        "token_sold_amount": token_sold_amount,
+                        "token_sold_address": token_sold_address,
+                        "token_bought": token_bought,
+                        "token_bought_amount": token_bought_amount,
+                        "token_bought_address": token_bought_address,
+                        "txn_usd_value": txn_usd_value,
+                        # 'sol_amount_in_txn': None,
+                        # 'sell_transfer_count': len(sell_transfers),
+                        # 'buy_transfer_count': len(buy_transfers),
+                        # 'gas_fee': feePaid,
+                        # 'jito_fees': 0,
+                    }
+                    processed_data.append(record)
+
+                new_data.extend(processed_data)
+
+                page_end_time = time.time()
+                page_duration = page_end_time - page_start_time
+                total_processing_time += page_duration
+                rows_per_second = len(rows_data) / page_duration if page_duration > 0 else 0
+                logger.info(f"Page {pages_counter + 1} processed in {page_duration:.2f}s ({rows_per_second:.2f} rows/s)")
+              
+                if apply_early_stopping and found_old_txn:
+                    logger.info(f"Found transactions older than {analyses_period} days. Stopping early.")
+                    break
+
+                # Check if there are more pages.
+                next_button = page.locator("div:nth-child(2) > button:nth-child(4)")
+                if await next_button.is_disabled() or pages_counter >= total_pages - 1:
+                    logger.info("No more pages or reached the last page. Exiting pagination.")
+                    break
+
+                await next_button.click()
+                pages_counter += 1
+                logger.info(f"Moving to page {pages_counter + 1}")
+                await page.wait_for_timeout(5000)
+            
+            combined_data = new_data
+            
+            # Optional final filtering (if not already using early stopping).
+            if not apply_early_stopping:
+                logger.info(f"Performing final filtering for transactions within {analyses_period} days")
+                filtered_data = []
+                for item in combined_data:
+                    trade_time = item.get("trade_time", "")
+                    try:
+                        if is_within_n_days(trade_time, analyses_period=analyses_period):
+                            filtered_data.append(item)
+                    except Exception as e:
+                        logger.warning(f"Error during final filtering for time '{trade_time}': {e}")
+                        filtered_data.append(item)
+                logger.info(f"Filtered data: {len(filtered_data)} out of {len(combined_data)} records remain")
+                combined_data = filtered_data
+            
+            await save_accumulated_data(address, combined_data)
+            
+            pages_processed = pages_counter + 1
+            avg_time_per_page = total_processing_time / pages_processed if pages_processed > 0 else 0
+            logger.info(f"Scraping completed. Processed {pages_processed} pages in {total_processing_time:.2f}s (avg {avg_time_per_page:.2f}s per page)")
+            logger.info(f"Total records after filtering: {len(combined_data)}")
+            
+            return combined_data
+
     except Exception as e:
-        logging.error(f"Error in process_coupon_code: {e}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ An unexpected error occurred. Please try again later.",
-        )
+        logger.error(f"An unexpected error occurred: {e}")
+        try:
+            if 'page' in locals() and page and not page.is_closed():
+                await take_error_screenshot(page, "pagination_error")
+        except Exception as ss_err:
+            logger.error(f"Could not take final error screenshot: {ss_err}")
 
-def subscription_required(func):
-    @wraps(func)
-    async def wrapper(update, context, *args, **kwargs):
-        user_id = update.message.from_user.id
-        subscription_status = await checkSubscription(user_id)
+async def get_all_signatures(mint_address, active_proxies=None, proxy=None):
+    URL = "http://solscan.io"
+    pages_counter = 0
+    total_processing_time = 0
 
-        if not subscription_status.get("hasSubscription"):
-            # Inform the user they need to subscribe
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=(
-                    "❌ *Access Denied: Subscription Required!*\n"
-                    "To access this feature, you need an active subscription. "
-                    "Please subscribe to continue. 🚀"
-                ),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔒 Subscribe", callback_data="subscribe")]
-                ])
-            )
-            return  # Prevent the original command from executing
+    metadata_dict_s = [mint_address]
+    metadata_dict = await fetch_and_store_metadata(metadata_dict_s, proxy=None)
+    # Ensure check_symbol is a string
+    check_symbol = metadata_dict.get(mint_address, {})\
+                                .get('content', {})\
+                                .get('metadata', {})\
+                                .get('symbol', 'N/A')
+    
+    # Load any existing data if available
+    all_data = await load_existing_data(mint_address)
+    
+    # Create a set of existing signatures for quick lookup
+    existing_signatures = set()
+    for item in all_data:
+        if item.get("signature") and item["signature"] != "N/A":
+            existing_signatures.add(item["signature"])
+    
+    logger.info(f"Found {len(existing_signatures)} existing signatures")
+    
+    # New data container
+    new_data = []
+    found_existing = False
 
-        # Proceed with the original function if the user has a valid subscription
-        return await func(update, context, *args, **kwargs)
-    return wrapper
+    try:
+        async with async_playwright() as p:
+            browser_options = {
+                "headless": True,
+                "slow_mo": 0,
+            }
+
+            browser = await p.firefox.launch(**{k: v for k, v in browser_options.items() if v is not None})
+            context = await browser.new_context(ignore_https_errors=True)
+            page = await context.new_page()
+
+            target_url = f"{URL}/token/{mint_address}?activity_type=ACTIVITY_TOKEN_SWAP&activity_type=ACTIVITY_AGG_TOKEN_SWAP#defiactivities"
+            await page.goto(target_url, timeout=90000)
+            logger.info(f"Accessed URL: {target_url}")
+
+            if not await check_and_solve_cloudflare(page, context):
+                logger.error("Failed to bypass Cloudflare. Aborting.")
+                return all_data
 
 
-async def button_handler(update: Update, context: CallbackContext) -> None:
-    query = update.callback_query
-    await query.answer()  # Acknowledge the callback
-    logger.info(f"Callback query received: {query.data}")
+            # Wait for activities to load
+            await page.wait_for_selector(".caption-bottom", timeout=60000)
 
-    if query.data == "fetch_holders":
-        await query.message.reply_text("Please enter the mint address:")
-        context.user_data["awaiting_mint"] = "top_holders"
-        logger.info("Awaiting mint address for top holders.")
-    elif query.data == "fetch_top_holders":
-        await query.message.reply_text("Please enter the mint address:")
-        context.user_data["awaiting_mint"] = "top_traders"
-        logger.info("Awaiting mint address for top traders.")
+            # Get total activities count
+            activity_element = await page.get_by_text('activities(s)').first.text_content()
+            match = re.search(r"Total\s([\d,]+)", activity_element)
+            if not match:
+                logger.warning("Total activities not found.")
+                return
+                
+            total_activities = int(match.group(1).replace(",", ""))
+            rows_per_page = 100
+            total_pages = (total_activities + rows_per_page - 1) // rows_per_page
+            logger.info(f"Total activities: {total_activities} | Pages: {total_pages}")
 
+            # Set rows per page to 100
+            pagination_button = page.locator("button[role='combobox']")
+            await pagination_button.click()
+            await page.get_by_label("100", exact=True).get_by_text("100").click()
+            await page.wait_for_timeout(3000)
 
+            while pages_counter < total_pages:
+                page_start_time = time.time()
+                logger.info(f"Processing page {pages_counter + 1} of {total_pages}")
+                
+                # Fetch all rows' data with a single evaluation in the browser context
+                rows_data = await page.evaluate('''
+                    () => {
+                        const rows = Array.from(document.querySelectorAll(".caption-bottom tr:not(:empty)"));
+                        return rows.map(row => {
+                            const cells = Array.from(row.querySelectorAll("td")).map(td => td.innerText.trim());
+                            return cells;
+                        });
+                    }
+                ''')
+                logger.info(f"Row_data: {rows_data}")
+                logger.info(f"Found {len(rows_data)} rows on page {pages_counter + 1}")
+                processed_data = []
 
-# Capture the mint address from the user
-async def capture_mint_address(update: Update, context: CallbackContext) -> None:
-    if context.user_data.get("awaiting_mint"):
-        mint_address = update.message.text.strip()
-        context.user_data["awaiting_mint"] = False  # Reset the flag
-        logger.info(f"Received mint address: {mint_address}")
-        await update.message.reply_text(f"Fetching top holders for token: {mint_address}...")
-        await top_holders(update, context, mint_address)
+                for row in rows_data:
+                    # Skip any empty rows or rows that don't have the expected number of columns.
+                    if not row or len(row) < 7:
+                        continue
+
+                    # Extract the values assuming a fixed column order.
+                    signature = row[1].strip()
+                    trade_time = row[2].strip()
+                    transaction_by = row[4].strip()
+                    
+                    # The 6th element is a newline-separated string
+                    details = row[5].splitlines()
+                    if len(details) < 4:
+                        continue
+
+                    token_sold_amount = details[0].strip()
+                    token_sold = details[1].strip()
+                    token_bought_amount = details[2].strip()
+                    token_bought = details[3].strip()
+
+                    txn_usd_value = row[6].strip()
+
+                    record = {
+                        "mint_addr": mint_address,
+                        "mint_symbol": check_symbol,
+                        "signature": signature,
+                        "trade_time": trade_time,
+                        "transaction_by": transaction_by,
+                        "token_sold_amount": token_sold_amount,
+                        "token_sold": token_sold,
+                        "token_bought_amount": token_bought_amount,
+                        "token_bought": token_bought,
+                        "txn_usd_value": txn_usd_value
+                    }
+                    
+                    processed_data.append(record)
+
+                # Check for duplicates by filtering out records with signatures that already exist
+                page_new_data = []
+                for item in processed_data:
+                    sig = item.get("signature")
+                    if sig and sig != "N/A":
+                        if sig in existing_signatures:
+                            # Duplicate found; skip this item.
+                            continue
+                        else:
+                            page_new_data.append(item)
+                            # Add signature to the set so that subsequent pages also consider it
+                            existing_signatures.add(sig)
+                    else:
+                        # If signature is missing or invalid, include it or handle accordingly
+                        page_new_data.append(item)
+                
+                if page_new_data:
+                    logger.info(f"Added {len(page_new_data)} new records on page {pages_counter + 1}.")
+                    new_data.extend(page_new_data)
+                else:
+                    logger.info(f"All records on page {pages_counter + 1} are duplicates.")
+                    found_existing = True
+
+                # Update combined data and save
+                combined_data = new_data + all_data
+                await save_accumulated_data(mint_address, combined_data)
+
+                page_end_time = time.time()
+                page_duration = page_end_time - page_start_time
+                total_processing_time += page_duration
+                rows_per_second = len(rows_data) / page_duration if page_duration > 0 else 0
+                logger.info(f"Page {pages_counter + 1} processed in {page_duration:.2f}s ({rows_per_second:.2f} rows/s)")
+                
+                # Stop if only duplicates are found on the current page
+                if found_existing and len(page_new_data) == 0:
+                    logger.info("No new records found on this page. Stopping as existing data is caught up.")
+                    break
+
+                # Check if there are more pages
+                next_button = page.locator("div:nth-child(2) > button:nth-child(4)")
+                if await next_button.is_disabled() or pages_counter >= total_pages - 1:
+                    logger.info("No more pages or reached the last page. Exiting pagination.")
+                    break
+
+                await next_button.click()
+                pages_counter += 1
+                logger.info(f"Moving to page {pages_counter + 1}")
+                await page.wait_for_timeout(5000)
+            
+            # Final save to ensure everything is captured.
+            combined_data = new_data + all_data
+            await save_accumulated_data(mint_address, combined_data)
+            
+            pages_processed = pages_counter + 1
+            avg_time_per_page = total_processing_time / pages_processed if pages_processed > 0 else 0
+            logger.info(f"Scraping completed. Processed {pages_processed} pages in {total_processing_time:.2f}s (avg {avg_time_per_page:.2f}s per page)")
+            logger.info(f"Added {len(new_data)} new records. Total records: {len(combined_data)}")
+            
+            return combined_data
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        # Try to take a final screenshot if browser is still available
+    try:
+        # Only attempt screenshot if the page is available and not closed
+        if 'page' in locals() and page and not page.is_closed():
+            await take_error_screenshot(page, "pagination_error")
+    
+    except Exception as ss_err:
+        logger.error(f"Could not take final error screenshot: {ss_err}")
+
+async def fetch_token_DEFI_transactions(update, active_proxies, proxy, mint_address):
+    relevant_transactions = []
+    
+    # Fetch all transaction data
+    all_transactions = await get_all_signatures(mint_address, active_proxies, proxy)
+    
+    # Filter relevant transactions if needed (or keep all)
+    if all_transactions:
+        relevant_transactions.extend(all_transactions)
     else:
-        logger.warning("Received unexpected message without awaiting mint address.")
-        await update.message.reply_text("Please use the button to fetch top holders.")
+        print(f"No relevant transactions found in this batch for {mint_address}.")
+        
+    return relevant_transactions
 
-async def get_token_mets(mint):
+async def get_asset(sol_address, proxy):
     url = GET_ASSET_URL
-    async with aiohttp.ClientSession() as session:
+    # If a proxy is provided, use it; otherwise, no proxy will be used
+    connector = None
+    if proxy:
+        ip, port, username, password = proxy.split(':')
+        proxy_url = f"http://{username}:{password}@{ip}:{port}"
+        connector = TCPConnector()
+
+    # Create the session with or without a proxy
+    async with ClientSession(connector=connector) as session:
         async with session.post(
             url,
             headers={'Content-Type': 'application/json'},
@@ -2057,751 +1873,292 @@ async def get_token_mets(mint):
                 'id': 'my-id',
                 'method': 'getAsset',
                 'params': {
-                    'id': mint,
+                    'id': sol_address,
                     'displayOptions': {
-                        'showFungible': True
+                        'showFungible': True  # return details about a fungible token
                     }
                 }
-            })
+            }),
+            proxy=proxy_url if proxy else None  # Add the proxy here if provided
         ) as response:
             result = await response.json()
-            logger.info(f"Response from getAsset: {result}")
+            asset = result['result']
+            token_info = asset['token_info']
+            price_per_token = token_info['price_info']['price_per_token']
+            return price_per_token
 
-            asset = result.get('result', {})
-            print("asset")
-            print(asset)
-            if not asset:
-                logger.error("Asset not found in response.")
-                return None
-
-            token_info = asset.get('token_info', {})
-            print("Price INFO")
-            print(token_info.get('price_info', {}))
-            price_per_token = token_info.get('price_info', {}).get('price_per_token', None)
-            token_supply = token_info.get('supply', None)
-            token_decimals = token_info.get('decimals', None)
-
-            if token_supply is None or token_decimals is None:
-                logger.error("Missing token info in the response.")
-                return None
-
-            # market_cap = price_per_token * token_supply / 10**token_decimals
-            # logger.info(f"Calculated market cap: {market_cap}")
-
-            return token_decimals, token_supply
-
-
-# Function to find top holders
-async def find_top_holders(mint):
-    token_mets = await get_token_mets(mint)
-    if not token_mets:
-        logger.error("Failed to get token metadata. Exiting.")
-        return None
-
-    met1, met2 = token_mets  # Unpack safely since it's not None
-
+@celery.task(name='fetch_transactions')
+def fetch_transactions_task(active_proxies, proxies, mint_address):
+    logger.info(f"Starting fetch_transactions_task with mint_address: {mint_address}")
     try:
-        url = GET_ASSET_URL
-        page = 1
-        all_owners = {}
-        total_fetched = 0
+        # Create a new event loop to run the async function
+        loop = new_event_loop()
+        set_event_loop(loop)
+        # Call your async function
+        logger.info(f"About to call fetch_token_DEFI_transactions for {mint_address}")
+        result = loop.run_until_complete(fetch_token_DEFI_transactions(None, active_proxies, proxies, mint_address))
+        logger.info(f"fetch_token_DEFI_transactions completed for {mint_address}")
+        loop.close()
+        return result
+    except Exception as e:
+        import traceback
+        logger.error(f"Task error in fetch_transactions_task: {e}")
+        logger.error(traceback.format_exc())
+        raise  # Re-raise to mark task as failed
 
-        while True:
-            response = requests.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                data=json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "getTokenAccounts",
-                    "id": "helius-test",
-                    "params": {
-                        "page": page,
-                        "limit": 1000,
-                        "displayOptions": {},
-                        "mint": mint
-                    }
-                })
-            )
+@celery.task(name='fetch_account_transactions')
+def fetch_account_transactions_task(address, update, proxies, analyses_period, active_proxies):
+    logger.info(f"Starting fetch_account_transactions_task with address: {address}")
+    try:
+        # Create a new event loop to run the async function
+        loop = new_event_loop()
+        set_event_loop(loop)
+        # Call your async function
+        result = loop.run_until_complete(get_all_account_signatures(address, update, proxies, analyses_period, active_proxies))
+        loop.close()
+        return result
+    except Exception as e:
+        import traceback
+        logger.error(f"Task error in fetch_account_transactions_task: {e}")
+        logger.error(traceback.format_exc())
+        raise  # Re-raise to mark task as failed
 
-            if response.status_code != 200:
-                raise Exception(f"Error fetching data: {response.status_code}, {response.text}")
+@celery.task(name='fetch_check_token_transactions')
+def fetch_check_token_transactions_task(token_mint, active_proxies):
+    logger.info(f"Starting fetch_check_token_transactions_task with tokens: {token_mint}")
+    try:
+        global proxy_stats, proxy_cooldowns
+        proxy_stats = {}
+        proxy_cooldowns = {}
 
-            data = response.json()
-            logger.info(f"Fetched data for page {page}: {data}")
-
-            if not data.get("result") or not data["result"].get("token_accounts"):
-                logger.info("No more token accounts found.")
-                break
-
-            for account in data["result"]["token_accounts"]:
-                owner = account["owner"]
-                balance = int(account.get("amount", 0)) / 10 ** met1
-                met2_ = met2 / 10**met1
-                percent_sup = (balance / met2_) * 100
-
-                percent_sup = round(percent_sup, 2)
-
-                if owner in all_owners:
-                    all_owners[owner]["balance"] += balance
-                    all_owners[owner]["percent_supply"] += percent_sup
-                else:
-                    all_owners[owner] = {
-                        "balance": balance,
-                        "percent_supply": percent_sup
-                    }
-
-            total_fetched += len(data["result"]["token_accounts"])
-            logger.info(f"Total fetched so far: {total_fetched}")
-            page += 1
-
-        sorted_owners = sorted(all_owners.items(), key=lambda x: x[1]["balance"], reverse=True)
-
-        top_holders = [
-            {
-                "owner": owner,
-                "balance": details["balance"],
-                "percent_supply": details["percent_supply"]
+        start_time = time.time()
+        start_datetime = datetime.now()
+        
+        loop = new_event_loop()
+        set_event_loop(loop)
+        results = loop.run_until_complete(process_tokens_in_batches(token_mint, active_proxies))
+        
+        end_time = time.time()
+        end_datetime = datetime.now()
+        execution_time = end_time - start_time
+        total_tokens = len(token_mint)
+        successful_tokens = sum(1 for v in results.values() if v.get("score_normalised") != "N/A")
+        success_rate = (successful_tokens / total_tokens) * 100 if total_tokens > 0 else 0
+        
+        # Save overall debug information if needed
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"debug_{token_mint}_at_{timestamp}.json"
+        try:
+            debug_data = {
+                "results": results,
+                "proxy_stats": proxy_stats,
+                "success_rate": f"{success_rate:.2f}%",
+                "execution_time": f"{execution_time:.2f}s",
+                "start_time": start_datetime.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                "end_time": end_datetime.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                "cached_tokens": sum(1 for token in token_mint if get_cached_token_data(token) is not None)
             }
-            for owner, details in sorted_owners
-        ]
-
-        with open("top_holders.json", "w") as f:
-            json.dump(top_holders, f, indent=2)
-
-        logger.info("Top holders data saved to top_holders.json.")
-        return top_holders
-    except Exception as e:
-        logger.error(f"Error in find_top_holders function: {e}")
-        return None
-
-# Function to generate Excel file
-def generate_excel(mint, data, met1, met2):
-    try:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Top Token Holders"
-
-        # Add the main title
-        title = f"Top Holders of {mint}"
-        ws.merge_cells('A1:D1')  # Merge cells A1 to D1
-        title_cell = ws['A1']
-        title_cell.value = title
-
-        # Center-align the title
-        title_cell.alignment = Alignment(horizontal='center', vertical='center')
-
-        # Add headers to the Excel file
-        headers = ["S/N", "Account", "Balance", "Percentage"]
-        ws.append(headers)
-
-        # Set the alignment for header row (center alignment)
-        for col in range(1, 5):  # Columns A to D
-            cell = ws.cell(row=1, column=col)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        # Add the data to the Excel sheet
-        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-        for index, entry in enumerate(data, start=1):
-            row = [index, entry['owner'], entry['balance'], entry['percent_supply']]
-            ws.append(row)
-
-            # Apply conditional formatting: If balance or percentage > 5, color red
-            balance_cell = ws.cell(row=index + 1, column=3)  # Balance is in column C
-            percentage_cell = ws.cell(row=index + 1, column=4)  # Percentage is in column D
-            met2_ = met2 / 10**met1
-            exceed_five_percent = (5 * met2_) / 100  # calculate threshold for 5% of total supply
-
-            if entry['balance'] >= exceed_five_percent:  # Compare balance with the 5% threshold
-                balance_cell.fill = red_fill
-            if entry['percent_supply'] >= 5:  # Directly check if percent supply exceeds 5%
-                percentage_cell.fill = red_fill
-
-            # Center-align all cells
-            for col in range(1, 5):
-                cell = ws.cell(row=index + 1, column=col)
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        # Set column widths to auto-fit based on content length
-        for col in range(1, 5):  # Columns A to D
-            max_length = 0
-            column = chr(64 + col)  # Get the letter for column (e.g., A, B, C, D)
-            for cell in ws[column]:
-                try:
-                    if cell.value:
-                        max_length = max(max_length, len(str(cell.value)))
-                except Exception as e:
-                    logger.error(f"Error in calculating column width: {e}")
-
-            adjusted_width = max_length + 2  # Add some padding
-            # Apply a cap on width to prevent it from becoming too wide
-            max_column_width = 30
-            ws.column_dimensions[column].width = min(adjusted_width, max_column_width)
-
-        # Save to an Excel file with absolute path
-        file_name = f"top_holders_{mint}.xlsx"
-        file_path = path.abspath(file_name)
-        wb.save(file_path)
-        logger.info(f"Excel file saved at {file_path}")
-        return file_path
-    except Exception as e:
-        logger.error(f"Error generating Excel file: {e}")
-        return None
-
-# Function to handle top_holders command
-@subscription_required
-async def top_holders(update: Update, context: CallbackContext, mint: str = None) -> None:
-    # Get the mint address from context or arguments
-    if not mint:
-        mint = context.args[0] if context.args else None
-    if not mint:
-        await update.message.reply_text('Please provide a mint address.')
-        logger.warning("No mint address provided.")
-        return
-
-    await update.message.reply_text(f"Fetching top holders for token: {mint}...")
-    await update.message.reply_text("Fetching data for top holders... Please wait.")
-    logger.info(f"Fetching top holders for mint address: {mint}")
-
-    result = await find_top_holders(mint)
-    if result is None:
-        await update.message.reply_text("Failed to fetch top holders. Please try again later.")
-        return
-
-    met_data = await get_token_mets(mint)
-    if met_data is None:
-        await update.message.reply_text("Failed to fetch token metadata. Please check the mint address.")
-        return
-
-    met1, met2 = met_data
-
-    try:
-        if result:
-            await update.message.reply_text("Generating Excel file...")
-            file_path = generate_excel(mint, result, met1, met2)
-            if file_path is None:
-                await update.message.reply_text("Failed to generate Excel file.")
-                return
-
-            # Store file path in user context for later use
-            context.user_data["excel_file"] = file_path
-            logger.info(f"Excel file stored in user context: {file_path}")
-
-            # Provide a button for downloading
-            keyboard = [
-                [InlineKeyboardButton("Download Excel File", callback_data="download_excel")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "Top holders data is ready! Click the button below to download the Excel file.",
-                reply_markup=reply_markup
-            )
-            logger.info("Download button sent to user.")
-        else:
-            await update.message.reply_text("There was an error fetching top holders.")
-            logger.error("Result from find_top_holders is empty.")
-    except Exception as e:
-        logger.error(f"Error in top_holders function: {e}")
-        await update.message.reply_text(f"An error occurred: {str(e)}")
-
-
-@subscription_required
-async def top_traders(update: Update, context: CallbackContext, mint: str) -> None:
-    if not mint:
-        await update.message.reply_text("Please provide a mint address.")
-        logger.warning("No mint address provided.")
-        return
-
-    await update.message.reply_text(f"Fetching top traders for token: {mint}...")
-    logger.info(f"Fetching top traders for mint address: {mint}")
-
-    proxies = await load_proxies('proxies.txt')  # Ensure this returns a list
-    r = await create_redis_connection_pool()  # Await Redis connection pool
-
-    try:
-        # Fetch data for top traders
-        await update.message.reply_text("Fetching data for top traders... Please wait.")
-
-        # Do:
-        create_task(fetch_and_save_for_multiple_mint_addresses_top(r, update, mint, proxies))
-
-        # await update.message.reply_text(f"Top traders data for token {mint} has been successfully fetched.")
-    except Exception as e:
-        logger.error(f"Error in top_traders function: {e}")
-        await update.message.reply_text(f"An error occurred: {str(e)}")
-    finally:
-        await r.close()
-
-
-
-async def download_report_callback(update: Update, context: CallbackContext) -> None:
-    query = update.callback_query
-    await query.answer()  # Acknowledge the callback
-
-    if query.data == "download_traders":
-        file_path = context.user_data.get("traders_excel_file")
-        if file_path:
-            with open(file_path, "rb") as file:
-                await query.message.reply_document(document=file)
-                logger.info("Traders Excel file sent to user.")
-        else:
-            await query.message.reply_text("No traders report available to download.")
-            logger.warning("No traders Excel file found in user context.")
-    elif query.data == "download_holders":
-        file_path = context.user_data.get("excel_file")
-        if file_path:
-            with open(file_path, "rb") as file:
-                await query.message.reply_document(document=file)
-                logger.info("Holders Excel file sent to user.")
-        else:
-            await query.message.reply_text("No holders report available to download.")
-            logger.warning("No holders Excel file found in user context.")
-
-
-
-
-
-# Handler for downloading the Excel file
-async def download_excel(update: Update, context: CallbackContext) -> None:
-    query = update.callback_query
-    await query.answer()  # Acknowledge the callback
-    logger.info("Download Excel button clicked.")
-
-    # Get the file path from user context
-    file_path = context.user_data.get("excel_file")
-    if file_path:
-        if path.exists(file_path):
-            try:
-                with open(file_path, 'rb') as file:
-                    await query.message.reply_document(
-                        document=file,
-                        filename=path.basename(file_path)
-                    )
-                await query.message.reply_text("File sent successfully!")
-                logger.info(f"Excel file sent to user: {file_path}")
-            except Exception as e:
-                logger.error(f"Error sending file: {e}")
-                await query.message.reply_text("Failed to send the file. Please try again.")
-        else:
-            logger.error(f"File does not exist: {file_path}")
-            await query.message.reply_text("File not found. Please generate it again.")
-    else:
-        logger.warning("No file path found in user context.")
-        await query.message.reply_text("No file found to download.")
-
-# Global error handler
-async def error_handler(update: object, context: CallbackContext) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(f"An error occurred: {str(context.error)}")
-
-
-# --- Settings Modal ---
-async def open_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Display settings and analysis period options."""
-    query = update.callback_query
-
-    if query:  # If it's a callback query
-        await query.answer()
-        chat_id = query.message.chat.id
-        message = query.message
-    else:  # If it's a command
-        chat_id = update.message.chat.id
-
-    # Ensure user_data exists and set the default analysis period to 1 days
-    if chat_id not in user_data:
-        user_data[chat_id] = {"analyses_period": 1}  # Default to 1 day
-    else:
-        user_data[chat_id].setdefault("analyses_period", 1)  # Set default if not present
-
-    analyses_period = user_data[chat_id]["analyses_period"]
-
-    # Define keyboard
-    keyboard = [
-        [InlineKeyboardButton("— Trades Period —", callback_data="no_action")],
-        [
-            InlineKeyboardButton(
-                f"✅ 1 Day" if analyses_period == 1 else "1 Day", callback_data="period_1"
-            ),
-            InlineKeyboardButton(
-                f"✅ 7 Days" if analyses_period == 7 else "7 Days", callback_data="period_7"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"✅ 14 Days" if analyses_period == 14 else "14 Days", callback_data="period_14"
-            ),
-            InlineKeyboardButton(
-                f"✅ 30 Days" if analyses_period == 30 else "30 Days", callback_data="period_30"
-            ),
-        ],
-        [
-            InlineKeyboardButton("🔙 Menu", callback_data="open_main_menu"),
-            InlineKeyboardButton("❌ Close", callback_data="dismiss_message")
-        ]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Edit or send the settings message
-    settings_text = "⚙️ *Bot Settings*\n\nSelect your preferred analysis period:"
-    if query:
-        await message.edit_text(settings_text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=settings_text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-
-# --- Welcome Modal Triggered from Menu ---
-async def show_welcome_modal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Display the welcome modal when 'Menu' is clicked."""
-    query = update.callback_query
-    await query.answer()
-
-    # Updated keyboard with "🔒 Subscribe" button
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Analyze Wallets", callback_data="analyze_wallets"),
-            InlineKeyboardButton("💰 Fetch Top Holders", callback_data="fetch_holders"),
-        ],
-        [
-            InlineKeyboardButton("📈 Fetch Top Traders", callback_data="fetch_top_holders"),
-            InlineKeyboardButton("💡 Help & Instructions", callback_data="help_instructions"),
-        ],
-        [
-            InlineKeyboardButton("🔗 Referrals", callback_data="referrals"),
-            InlineKeyboardButton("🛠 Backup Bots", callback_data="backup_bots"),
-        ],
-        [
-            InlineKeyboardButton("🔒 Subscribe", callback_data="subscribe"),  # Added Subscribe button
-            InlineKeyboardButton("⚙️ Settings", callback_data="open_settings"),
-        ],
-        [
-            InlineKeyboardButton("❌ Dismiss", callback_data="dismiss_message"),
-        ],
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.message.edit_text(
-        f"🌟 *What you can do here:*\n"
-        "✅ *Analyze Wallets*: Track trading stats and trends effortlessly.\n"
-        "✅ *Discover Top Holders*: Fetch detailed token holder data with ease.\n"
-        "✅ *Explore Top Traders*: Identify influential traders and their activity.\n"
-        "✅ *Real-Time Insights*: Stay ahead with live wallet and token analysis.\n\n"
-        "👇 Select an option below to get started:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=reply_markup,
-    )
-
-
-
-async def dismiss_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler to dismiss a message."""
-    query = update.callback_query
-    await query.answer()
-    await query.message.delete() 
-
-# --- Callback Query Handler ---
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button interactions."""
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat.id
-
-    if query.data == "no_action":
-        return  # Do nothing
-
-    if query.data.startswith("period_"):
-        # Handle analysis period selection
-        selected_period = query.data.split("_")[1]
-        user_data.setdefault(chat_id, {})["analyses_period"] = (
-            int(selected_period) if selected_period.isdigit() else "max"
-        )
-        await open_settings(update, context)
-    elif query.data == "open_settings":
-        await open_settings(update, context)
-    elif query.data == "open_main_menu":
-        await show_welcome_modal(update, context)
-    elif query.data == "dismiss_message":
-        await query.message.delete()
-
-
-
-
-# Help & Instructions callback handler
-async def help_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE): 
-    """Handler for /help command and Help & Instructions button."""
-    # Define the keyboard
-    keyboard = [
-        [
-            InlineKeyboardButton("🔙 Menu", callback_data="open_main_menu"),
-            InlineKeyboardButton("❌ Dismiss", callback_data="dismiss_message")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Check if this is a callback query or a command
-    query = update.callback_query
-
-    # Define the help message text
-    help_message = (
-        "💡 *Help & Instructions*\n\n"
-        "Welcome to the Wallet Analysis Bot! Here's how to make the most of it:\n\n"
-        "1️⃣ *Analyze Wallets*: Tap 📊 Analyze Wallets and provide a wallet address to view trading activities.\n"
-        "2️⃣ *Fetch Top Holders*: Use 💰 Fetch Top Holders to see wallets with the largest holdings.\n"
-        "3️⃣ *Fetch Top Traders*: Use 📈 Fetch Top Traders to identify the most active traders.\n"
-        "4️⃣ *Set Periods*: Adjust analysis durations and preferences via ⚙️ Settings.\n"
-        "5️⃣ *Track Trends*: Monitor real-time insights for the supported blockchain, *Solana*.\n"
-        "6️⃣ *Referrals*: Tap 🔗 Referrals to invite friends and earn rewards.\n"
-        "7️⃣ *Backup Bots*: Access 🛠 Backup Bots to view alternative bot options.\n\n"
-        "Use the buttons below to return to the menu or dismiss this message."
-    )
-
-    if query:
-        # Handle the callback query
-        await query.answer()
-        await query.message.edit_text(
-            text=help_message,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
-        )
-    else:
-        # Handle the /help command
-        await update.message.reply_text(
-            text=help_message,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup  # Include the keyboard here as well
-        )
-
-
-# Handle callback from the Start button
-async def handle_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await start(query, context)
-
-
-
-async def handle_period_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user selecting an analysis period."""
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat.id
-    period = int(query.data.split("_")[1])  # Extract the period from callback_data
-
-    # Update the user's selected analysis period
-    user_data[chat_id] = {"analyses_period": period}
-
-    await open_settings(update, context)
-
-
-async def gridbutton_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard button clicks with subscription checks."""
-    query = update.callback_query
-    user_id = query.from_user.id  # Get the user ID
-    await query.answer()
-
-    if query.data == "open_settings":
-        await open_settings(update, context)
-
-    elif query.data == "analyze_wallets":
-        # Perform subscription check
-        subscription_status = await checkSubscription(user_id)
-        if not subscription_status.get("hasSubscription"):
-            # User doesn't have an active subscription
-            await query.message.reply_text(
-                "❌ *Access Denied: Subscription Required!*\n"
-                "To use the wallet analysis feature, you need an active subscription. "
-                "Please subscribe to continue. 🚀",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔒 Subscribe", callback_data="subscribe")]
-                ])
-            )
-            return  # Exit the function early if the user is not subscribed
-
-        # If subscription is valid, proceed with the action
-        await query.message.reply_text("Please enter the wallet address(es) for analysis:")
-
-    elif query.data == "help_instructions":
-        await handle_help_instructions(update, context)
-
-    elif query.data == "backup_bots":
-        await query.message.reply_text("🛠 *Backup bots will be added soon!*", parse_mode="Markdown")
-
-    elif query.data == "referrals":
-        await query.message.reply_text("🔗 Our referral reward system is coming soon!")
-
-
-
-async def prompt_continue_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask the user if they want to continue analysis."""
-    keyboard = [
-        [
-            InlineKeyboardButton("Yes", callback_data="continue_analysis_yes"),
-            InlineKeyboardButton("No", callback_data="continue_analysis_no"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if update.message:
-        await update.message.reply_text("Do you want to analyze another wallet?", reply_markup=reply_markup)
-    elif update.callback_query:
-        await update.callback_query.message.reply_text("Do you want to analyze another wallet?", reply_markup=reply_markup)
-
-
-async def handle_continue_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle user's response to continue analysis prompt."""
-    query = update.callback_query
-    await query.answer() 
-
-    if query.data == "continue_analysis_yes":
-        await query.message.reply_text("Great! Please send the wallet address(es) for analysis:")
-    elif query.data == "continue_analysis_no":
-        await query.message.reply_text("Thank you for using BagScan! If you need further analysis, just type /start. or use the menu button.")
-
-
-async def createNewUser(data):
-    try:
-        response = requests.post("https://bagscan-bot.vercel.app/api/user/register", json=data)
-        if response.status_code == 201:
-            # Log success for a new user registration
-            logging.info(f"✅ User {data['username']} (ID: {data['id']}) registered successfully.")
-        elif response.status_code == 409:
-            # Log if the user is already registered
-            logging.info(f"ℹ️ User {data['username']} (ID: {data['id']}) is already registered.")
-        else:
-            # Log unexpected responses
-            logging.warning(f"⚠️ Unexpected response while registering user {data['username']} (ID: {data['id']}): {response.status_code} - {response.text}")
-        return None
-    except Exception as e:
-        # Log any errors during the process
-        logging.error(f"❌ Error while creating new user {data['username']} (ID: {data['id']}): {e}")
-        return None
-
-
-async def checkSubscription(data):
-    try:
-        # Send a GET request to the subscription status API
-        response = requests.get(f"https://bagscan-bot.vercel.app/api/subscription_status/{data}")
+            with open(filename, "w") as f:
+                json.dump(debug_data, f, indent=4)
+            logger.info(f"Debug information saved to {filename}")
+        except Exception as e:
+            logger.error(f"Error saving debug file: {e}")
         
-        if response.status_code == 200:
-            # Parse the JSON response
-            subscriptionStatus = response.json()
-            logging.info(f"Subscription status for user {data}: {subscriptionStatus}")
-            
-            # Safely return the "data" object from the response or a default structure
-            return subscriptionStatus.get("data", {"hasSubscription": False, "daysLeft": None})
+        logger.info(f"Request completed. Success rate: {success_rate:.2f}% ({successful_tokens}/{total_tokens})")
+        logger.info(f"Execution started at {start_datetime.strftime('%Y-%m-%d %H:%M:%S')} and ended at {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Total execution time: {execution_time:.2f} seconds")
         
-        # Log non-200 status codes and return a default structure
-        logging.warning(f"Non-200 response from subscription API: {response.status_code}")
-        return {"hasSubscription": False, "daysLeft": None}
+        loop.close()
+        
+        return {
+            "results": results,
+            "stats": {
+                "total_tokens": total_tokens,
+                "successful_fetches": successful_tokens,
+                "success_rate": f"{success_rate:.2f}%",
+                "execution_time": f"{execution_time:.2f}s",
+                "start_time": start_datetime.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                "end_time": end_datetime.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                "cached_tokens_used": sum(1 for token in token_mint if token in results and "from_cache" in results[token])
+            }
+        }
     
     except Exception as e:
-        # Log any exceptions that occur and return a default structure
-        logging.error(f"Error while checking subscription for user {data}: {e}")
-        return {"hasSubscription": False, "daysLeft": None}
+        import traceback
+        logger.error(f"Task error in fetch_check_token_transactions_task: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
+# Flask API endpoint to check multiple proxies
+@app.route("/checkProxies", methods=["POST"])
+def check_proxies():
+    data = request.get_json()
+    proxies = data.get("proxies", [])
 
-async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_input = update.message.text.strip()
-    chat_id = update.message.chat.id
+    if not proxies:
+        return jsonify({"error": "Proxies list is required"}), 400
 
-    # Check if the bot is awaiting a mint address for top holders or top traders
-    if context.user_data.get("awaiting_mint"):
-        action = context.user_data.pop("awaiting_mint")  # Retrieve and clear the flag
-        if action == "top_holders":
-            await top_holders(update, context, user_input)  # Pass user_input as mint
-        elif action == "top_traders":
-            await top_traders(update, context, user_input)  # Pass user_input as mint
-        return
+    active_proxies = process_proxies_in_batches(proxies)
+    return jsonify({"active_proxies": active_proxies})
 
-    # Ensure user data exists and analysis period is set
-    if chat_id not in user_data:
-        user_data[chat_id] = {"analyses_period": 1}  # Set default
+@app.route("/getSolBalance", methods=["GET"])
+def get_sol_balance():
+    if not verify_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
 
-    analyses_period = user_data[chat_id].get("analyses_period", 30)  # Default to 30 days
+    # Extract address and proxy from query params
+    address = request.args.get("address")
+    proxy = request.args.get("proxy")
 
-    # Split addresses by spaces or commas
-    addresses = [address.strip() for address in re.split(r'[,\s]+', user_input) if address]
+    if not address:
+        return jsonify({"error": "Missing address parameter"}), 400
 
-    if not addresses:
-        await update.message.reply_text("No valid wallet addresses found. Please try again.")
-        return
+    # JSON-RPC payload for Solana balance check
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [address, {"commitment": "confirmed"}]
+    }
 
-    # Remove duplicates by converting to a set and back to a list
-    unique_addresses = list(set(addresses))
-    if len(unique_addresses) != len(addresses):
-        await update.message.reply_text(
-            f"Duplicate addresses were removed. Proceeding with the unique addresses: {', '.join(unique_addresses)}"
-        )
+    # Setup proxies if provided
+    proxies = None
+    if proxy:
+        try:
+            ip, port, username, password = proxy.split(':')
+            proxy_url = f"http://{username}:{password}@{ip}:{port}"
+            proxies = {
+                "http": proxy_url,
+                "https": proxy_url
+            }
+        except ValueError:
+            return jsonify({"error": "Invalid proxy format"}), 400
 
-    proxies = await load_proxies('proxies.txt')  # Ensure this returns a list
-    # r = await create_redis_connection_pool()  # Await Redis connection pool
+    # Send the request to Solana RPC
+    response = requests.post(GET_NATIVE_BAL_URL, json=payload, proxies=proxies)
+
+    if response.status_code == 200:
+        result = response.json()
+        balance = result.get("result", {}).get("value", 0) / 1_000_000_000  # Convert lamports to SOL
+        return jsonify({"balance": balance})
+    else:
+        return jsonify({"error": f"RPC Error: {response.status_code}", "details": response.text}), 500
+
+@app.route('/get_asset', methods=['POST'])
+async def fetch_asset():
+    data = request.json
+    sol_address = data.get("sol_address")
+    proxy = data.get("proxy", None)  # Optional proxy
+
+    if not sol_address:
+        return jsonify({"error": "Solana address is required"}), 400
 
     try:
-        logging.info(f"Fetching data for addresses: {unique_addresses} with analysis period: {analyses_period} days")
-        await update.message.reply_text(
-            f"Fetching data for the following addresses:\n" + "\n".join(unique_addresses) +
-            f"\nAnalysis period: {analyses_period} days. Please wait..."
-        )
-        # await fetch_and_save_for_multiple_addresses_wal(r, update, unique_addresses, analyses_period, proxies)
-        await fetch_and_save_for_multiple_addresses_wal(update, unique_addresses, analyses_period, proxies)
-        await update.message.reply_text("Data fetching completed successfully!")
-        await prompt_continue_analysis(update, context)
-
+        price_per_token = await get_asset(sol_address, proxy)
+        return jsonify({"price_per_token": price_per_token})  # Ensure response is JSON
     except Exception as e:
-        logging.exception("Error while fetching data")
-        await update.message.reply_text("An error occurred while fetching the data. Please try again later.")
-    # finally:
-        # await r.close()
-
-if __name__ == '__main__':
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)    
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-   # Command Handlers (specific commands first)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("settings", open_settings))
-    application.add_handler(CommandHandler("help", help_instructions))
-    application.add_handler(CommandHandler('top_holders', top_holders))
-    application.add_handler(CommandHandler('top_traders', top_traders))
-
-# CallbackQuery Handlers (specific patterns first)
-    application.add_handler(CallbackQueryHandler(help_instructions, pattern="help_instructions"))
-    application.add_handler(CallbackQueryHandler(handle_continue_analysis, pattern="^continue_analysis_"))
-    application.add_handler(CallbackQueryHandler(handle_period_selection, pattern="^period_"))
-    application.add_handler(CallbackQueryHandler(show_welcome_modal, pattern="open_main_menu"))
-    application.add_handler(CallbackQueryHandler(dismiss_message, pattern="dismiss_message"))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^fetch_holders$"))
-    application.add_handler(CallbackQueryHandler(download_excel, pattern="^download_excel$"))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^fetch_top_holders$"))
-    application.add_handler(CallbackQueryHandler(download_report_callback, pattern="^download_traders$"))
-    application.add_handler(CallbackQueryHandler(download_report_callback, pattern="^download_holders$"))
-
-      # Add a handler for the subscription modal
-    application.add_handler(CallbackQueryHandler(subscription_modal, pattern="^subscribe$"))
-
-    # Add a handler for processing the coupon code
-    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, process_coupon_code))
-
-# # General CallbackQuery Handlers (fallback)
-    application.add_handler(CallbackQueryHandler(gridbutton_handler))
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
-
-# General Message Handlers (fallback for text inputs)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_mint_address))
+        return jsonify({"error": str(e)}), 500  # Return error message as JSON
 
 
-   # Register the global error handler
-    application.add_error_handler(error_handler)
+@app.route('/fetchAccountTrans', methods=['POST'])
+def fetch_account_transactions_fetcher():
+    data = request.json
+    address = data.get('address')
+    update = data.get('update')
+    proxies = data.get('proxies')
+    analyses_period = data.get('analyses_period')
+    active_proxies = data.get('active_proxies')
 
-    my_commands = [
-        BotCommand("start", "Start the bot"),
-        BotCommand("settings", "Open settings to set analysis period"),
-        BotCommand("help", "Get help and usage instructions")
-    ]
-    application.bot.set_my_commands(my_commands)
+
+    if not address or not analyses_period or not active_proxies:
+        return jsonify({"error": "Missing required parameters"}), 400
     
-    application.run_polling()
+    # Enqueue the background task and immediately return the task id
+    task = fetch_account_transactions_task.delay(address, update, proxies, analyses_period, active_proxies)
+    logger.info(f"Created task with ID: {task.id}")
+    return jsonify({"task_id": task.id}), 202
+
+@app.route('/fetchTokenDEFITrans', methods=['POST'])
+def fetch_token_transactions():
+    data = request.json
+    logger.info(f"Received request data: {data}")
+    active_proxies = data.get('active_proxies')
+    proxies = data.get('proxies')
+    mint_address = data.get('mint_address')
+
+    if not mint_address or not active_proxies:
+        logger.error("Missing required parameters")
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    # Enqueue the background task and immediately return the task id
+    task = fetch_transactions_task.delay(active_proxies, proxies, mint_address)
+    logger.info(f"Created task with ID: {task.id}")
+    return jsonify({"task_id": task.id}), 202
+
+
+@app.route("/checkScamTokens", methods=["POST"])
+def check_tokens():
+    """
+    Expects a JSON payload with 'tokens' (list) and 'proxies' (list).
+    Processes tokens while utilizing optimized caching system.
+    """
+    data = request.get_json()
+    token_mint = data.get("tokens", [])
+    active_proxies = data.get("proxies", [])
+    
+    if not token_mint or not active_proxies:
+        return jsonify({"error": "Missing tokens or proxies"}), 400
+    
+    # Enqueue the background task and immediately return the task id
+    task = fetch_check_token_transactions_task.delay(token_mint, active_proxies)
+    logger.info(f"Created task with ID: {task.id}")
+    return jsonify({"task_id": task.id}), 202
+
+@app.route('/task_status/<task_id>', methods=['GET'])
+def task_status(task_id):
+    task_result = fetch_transactions_task.AsyncResult(task_id) or fetch_account_transactions_task.AsyncResult(task_id) or fetch_account_transactions_fetcher.AsyncResult(task_id)
+    if task_result is None:
+        return jsonify({"error": "Task not found"}), 404
+    
+    if task_result.state == 'PENDING':
+        response = {'state': task_result.state, 'status': 'Pending...'}
+    elif task_result.state == 'SUCCESS':
+        if isinstance(task_result.result, dict) and 'error' in task_result.result:
+            # Task completed but returned an error
+            response = {
+                'state': 'FAILURE',
+                'error': task_result.result.get('error'),
+                'traceback': task_result.result.get('traceback')
+            }
+        else:
+            response = {'state': task_result.state, 'result': task_result.result}
+    elif task_result.state == 'FAILURE':
+        response = {
+            'state': task_result.state, 
+            'error': str(task_result.result),
+            'traceback': task_result.traceback
+        }
+    else:
+        response = {'state': task_result.state, 'status': 'Processing...'}
+    
+    logger.info(f"Task {task_id} status: {task_result.state}")
+    return jsonify(response)
+
+@app.route('/fetchMetadata', methods=['POST'])
+async def fetch_the_metadata():
+    data = request.get_json()
+    unique_token_addresses = data.get("unique_token_addresses", [])
+    proxy = data.get("proxy", None)  # Optional proxy
+
+    if not unique_token_addresses:
+        return jsonify({"error": "No token addresses provided"}), 400
+
+    try:
+        metadata = await fetch_and_store_metadata(unique_token_addresses, proxy)
+        return jsonify({"metadata": metadata})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
